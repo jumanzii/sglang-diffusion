@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -512,6 +513,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         layouts,
         condition_latents=None,
         prefix_caches=None,
+        dpcache_state=None,
         **kwargs,
     ):
         if isinstance(encoder_hidden_states, list):
@@ -527,6 +529,43 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         start, end = rank * local_len, (rank + 1) * local_len
         images = self.img_in(hidden_states[:, start:end])
         temb = self.time_text_embed((timestep.to(images.dtype) / 1000), images.dtype)
+        # DPCache indexes steps by the loop's zero-based step, never by timestep value
+        step = None if dpcache_state is None else get_forward_context().current_timestep
+        if step is not None and not dpcache_state.is_full_step(step):
+            # no block runs, so layerwise offload streams no block weights
+            images = dpcache_state.predict(step)
+        else:
+            images = self._forward_blocks(
+                images,
+                temb,
+                timestep,
+                encoder_hidden_states,
+                layouts,
+                condition_latents,
+                prefix_caches,
+                start,
+                end,
+            )
+            if step is not None:
+                dpcache_state.record(step, images)
+        output = self.proj_out(self.norm_out(images, temb))
+        if sp > 1:
+            output = sequence_model_parallel_all_gather(output, dim=1)
+        return output
+
+    def _forward_blocks(
+        self,
+        images,
+        temb,
+        timestep,
+        encoder_hidden_states,
+        layouts,
+        condition_latents,
+        prefix_caches,
+        start,
+        end,
+    ):
+        """Run every transformer block; returns the final feature before norm_out."""
         modulation = self.prepare_modulation(temb)
         prefix_modulation = None
         if prefix_caches is None or any(not cache[0] for cache in prefix_caches):
@@ -564,10 +603,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 ropes,
                 prefix_caches,
             )
-        output = self.proj_out(self.norm_out(images, temb))
-        if sp > 1:
-            output = sequence_model_parallel_all_gather(output, dim=1)
-        return output
+        return images
 
 
 EntryClass = QwenImage21Transformer2DModel

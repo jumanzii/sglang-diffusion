@@ -4,7 +4,19 @@ import math
 import torch
 from PIL import Image
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.cache.dpcache import (
+    DPCacheRequestSignature,
+    DPCacheState,
+    check_schedule_matches,
+    checkpoint_identity,
+    config_digest,
+)
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_sp_world_size,
+    get_tp_world_size,
+)
+from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -18,7 +30,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import Denois
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image
+
+logger = init_logger(__name__)
 
 SYSTEM_PROMPT = "Comprehend and analyze the provided prompt."
 SYSTEM_TEMPLATE = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
@@ -233,7 +248,107 @@ def prepare_qwen21_mu(batch, server_args):
     return "mu", batch.extra["qwen21_mu"]
 
 
+DPCACHE_BRANCHES = ("qwen21_positive", "qwen21_negative")
+
+
+def _has_active_lora(module):
+    return any(
+        isinstance(layer, BaseLayerWithLoRA)
+        and (layer.merged or not layer.disable_lora)
+        for layer in module.modules()
+    )
+
+
 class QwenImage21DenoisingStage(DenoisingStage):
+    def forward(self, batch, server_args):
+        states = self._attach_dpcache(batch, server_args)
+        if not states:
+            return super().forward(batch, server_args)
+        try:
+            batch = super().forward(batch, server_args)
+            if not batch.is_warmup:
+                logger.info(
+                    "DPCache: %s",
+                    ", ".join(
+                        f"{name} full={state.num_full} predicted={state.num_predicted}"
+                        for name, state in states.items()
+                    ),
+                )
+            return batch
+        finally:
+            # post_denoising_loop drops the branch kwargs; also clean up on error
+            for name in states:
+                batch.extra.get(name, {}).pop("dpcache_state", None)
+
+    def _attach_dpcache(self, batch, server_args):
+        """Give each branch of this request its own fresh DPCache state."""
+        schedule = batch.sampling_params.dpcache_schedule
+        if schedule is None:
+            return {}
+        if self._cache_dit_enabled and not self._cache_dit_requested_for_batch(batch):
+            # a previous request left the wrapper mounted; this one runs without it
+            self._unmount_cache_dit()
+        self._check_dpcache_supported(batch, server_args)
+        full_steps = check_schedule_matches(
+            schedule, self.dpcache_signature(batch, server_args)
+        )
+        if batch.extra.get("qwen21_positive") is None:
+            raise RuntimeError("DPCache needs the Qwen-Image 2.1 branch kwargs")
+        states = {}
+        for name in DPCACHE_BRANCHES:
+            branch = batch.extra.get(name)
+            if branch is not None:
+                branch["dpcache_state"] = DPCacheState(full_steps, len(batch.timesteps))
+                states[name] = branch["dpcache_state"]
+        return states
+
+    def dpcache_signature(self, batch, server_args):
+        """The request settings a DPCache schedule is calibrated for."""
+        return DPCacheRequestSignature(
+            pipeline=type(server_args.pipeline_config).__name__,
+            checkpoint=checkpoint_identity(server_args.model_path),
+            num_inference_steps=len(batch.timesteps),
+            height=batch.height,
+            width=batch.width,
+            guidance_scale=float(batch.guidance_scale),
+            do_classifier_free_guidance=bool(batch.do_classifier_free_guidance),
+            quality=batch.quality,
+            attention_backend=server_args.attention_backend,
+            dtype=str(self.transformer.proj_out.weight.dtype).removeprefix("torch."),
+            scheduler=type(batch.scheduler).__name__,
+            scheduler_config_sha256=config_digest(batch.scheduler.config),
+            timesteps=tuple(batch.timesteps.float().cpu().tolist()),
+            sigmas=tuple(batch.scheduler.sigmas.float().cpu().tolist()),
+        )
+
+    def _check_dpcache_supported(self, batch, server_args):
+        # v1 is validated only for single-image BF16 text-to-image without CFG;
+        # anything else would compose approximations or change what was calibrated.
+        prompts = batch.prompt if isinstance(batch.prompt, list) else [batch.prompt]
+        unsupported = {
+            "torch compile": server_args.enable_torch_compile,
+            "breakable CUDA graphs": server_args.enable_breakable_cuda_graph,
+            "Cache-DiT": self._cache_dit_requested_for_batch(batch),
+            "TeaCache": batch.enable_teacache,
+            "Spectrum": batch.enable_spectrum,
+            "skip-softmax attention": batch.skip_softmax_params is not None,
+            "attention backend override": batch.attention_backend_override is not None,
+            "classifier-free guidance": batch.do_classifier_free_guidance,
+            "non-lossless quality": batch.quality != "lossless",
+            "reference images": batch.condition_image is not None,
+            "more than one image per request": len(prompts) != 1
+            or batch.num_outputs_per_prompt != 1,
+            "LoRA": _has_active_lora(self.transformer),
+            "non-BF16 transformer": self.transformer.proj_out.weight.dtype
+            != torch.bfloat16,
+            "CFG parallel": server_args.enable_cfg_parallel,
+            "sequence/tensor parallel": get_sp_world_size() > 1
+            or get_tp_world_size() > 1,
+        }
+        enabled = [name for name, on in unsupported.items() if on]
+        if enabled:
+            raise ValueError(f"dpcache_schedule cannot be combined with {enabled}")
+
     def _bcg_pad_prompt_kwargs(
         self, call_kwargs, current_model=None, force_bucket=None
     ):

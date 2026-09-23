@@ -1,0 +1,276 @@
+---
+title: "DPCache (Qwen-Image 2.1)"
+description: "Calibrated, request-scoped step skipping with a dynamic-programming key-step schedule."
+tag: "approx"
+---
+
+DPCache runs the full transformer on a calibrated subset of `K` denoising
+steps and, on every other step, extrapolates the final transformer-block feature
+from the two most recent full steps. A predicted step bypasses every
+transformer block, so block weights are not read or streamed; it still runs the
+lightweight per-step preparation (latent input projection and timestep
+embedding) and the output head (output norm conditioned on the current
+timestep, then the output projection). It adapts
+[DPCache](https://arxiv.org/abs/2602.22654) and requires no training,
+distillation, or weight changes.
+
+DPCache is an approximation. Outputs are not bit-identical to native inference
+unless every step is scheduled as full. Validate quality and latency on the
+exact model, resolution, step count, and hardware you deploy.
+
+## Scope
+
+DPCache is opt-in per request and currently supports only this configuration:
+
+- Qwen-Image 2.1 (`QwenImage21Pipeline`) with BF16 transformer weights.
+- Text-to-image with one prompt and one output per request. Reference images,
+  classifier-free guidance, LoRA, and `quality` values other than `lossless`
+  are rejected.
+- Single GPU, eager execution. Torch compile, breakable CUDA graphs, Cache-DiT,
+  TeaCache, Spectrum, skip-softmax attention, attention backend overrides, and
+  sequence, tensor, or CFG parallelism are rejected.
+
+A request that sets `dpcache_schedule` outside this scope fails with an error
+instead of silently running a different approximation. Requests without
+`dpcache_schedule` run the unchanged native path.
+
+## How it works
+
+1. **Calibrate.** Run native generations on a few calibration prompts and
+   record the final transformer-block feature (the input of the output norm)
+   at every step.
+2. **Score.** For every anchor pair `i < j` and later step `t`, predict
+   `h_j + (h_j - h_i) / (j - i) * (t - j)` in BF16 with the same function the
+   runtime uses, and record the mean absolute error against the recorded
+   feature. The cost of consecutive full steps `i < j < k` is the summed error
+   of the steps between `j` and `k`. Only steps the runtime actually predicts
+   are scored; the end of the trajectory is not treated as a scored step.
+3. **Plan.** An exact dynamic program over (previous, current) full-step pairs
+   picks the minimum-cost set of `K` full steps. Steps 0, 1, and 2 are always
+   full, and an optional `max_gap` bounds every gap between full steps,
+   including the last one.
+4. **Serve.** The schedule is a JSON artifact. It records the request settings
+   it was calibrated for (checkpoint revision, resolution, step count,
+   timesteps and sigmas, scheduler class and config digest, guidance scale,
+   attention backend, dtype, quality) plus calibration provenance. A request
+   whose settings differ is rejected before denoising.
+
+Predictions never become anchors, and each request (and each CFG branch) gets
+fresh state that is discarded when the request finishes or fails.
+
+## Usage
+
+Pass the parsed schedule JSON as the `dpcache_schedule` sampling parameter:
+
+```python
+import json
+
+from sglang.multimodal_gen import DiffGenerator
+
+generator = DiffGenerator.from_pretrained(
+    model_path="MODEL_PATH",  # Qwen-Image 2.1 checkpoint
+    num_gpus=1,
+)
+schedule = json.load(open("K24.json"))
+result = generator.generate(
+    sampling_params_kwargs={
+        "prompt": "A red bicycle leaning against a green door",
+        "width": 1024,
+        "height": 1024,
+        "num_inference_steps": 40,
+        "dpcache_schedule": schedule,
+    }
+)
+```
+
+The image API also accepts `dpcache_schedule` as a model-specific request
+field.
+
+## Calibrating a schedule
+
+`python/sglang/multimodal_gen/benchmarks/bench_qwen_image21_dpcache.py` builds
+schedules and reproduces the measurements below. Run it by path. Every GPU
+command accepts `--gpu-lock FILE` to share a GPU with other jobs through
+`flock`, and refuses to start while other compute processes use the GPU.
+
+```bash
+BENCH=python/sglang/multimodal_gen/benchmarks/bench_qwen_image21_dpcache.py
+
+# 1. Freeze prompt/seed splits (calibration, validation, held-out).
+python $BENCH corpus --out corpus.json --model-revision REVISION
+
+# 2. Capture final-block features on the calibration split.
+python $BENCH launch calib --corpus corpus.json --out runs/calib \
+  --model-path MODEL_PATH --source-dir python
+
+# 3. Capture the request signature and check disabled/all-full parity.
+python $BENCH launch parity --corpus corpus.json --out runs/parity \
+  --model-path MODEL_PATH --source-dir python
+
+# 4. Score PACT errors on the GPU and plan one schedule per budget.
+PYTHONPATH=python python $BENCH calibrate --corpus corpus.json \
+  --run runs/calib --signature-run runs/parity --out schedules \
+  --budgets 12 16 20 24 28 32 36 39 --max-gap 8 --source-commit COMMIT
+```
+
+Select a budget on a validation split, freeze the choice, and only then
+measure a held-out split:
+
+```bash
+python $BENCH launch sweep --split validation --arms K12 K16 K20 K24 \
+  --schedule-dir schedules --corpus corpus.json --out runs/validation \
+  --model-path MODEL_PATH --source-dir python
+python $BENCH score --run runs/validation      # needs the `lpips` package
+python $BENCH select --run runs/validation \
+  --scores runs/validation/scores.json --out selection.json
+python $BENCH launch sweep --split heldout --arms SELECTED_ARMS \
+  --selection selection.json --schedule-dir schedules --timing-repeats 3 \
+  --corpus corpus.json --out runs/heldout \
+  --model-path MODEL_PATH --source-dir python
+```
+
+`report` and `select` likewise treat an arm's timing as complete only when every
+planned timing block has both the arm's and the native measurement, so a
+speedup never rests on a surviving subset.
+
+`score` compares every planned capture with the first native capture of the
+same prompt and seed, and records tensor equality, LPIPS (white-composited
+RGBA and alpha-dropped RGB), and alpha error. A failed or missing planned
+capture makes its arm incomplete, and incomplete arms never pass a gate.
+
+## Measured results
+
+These are preliminary numbers from one GPU and a small prompt set. They do not
+transfer to other models, resolutions, step counts, or hardware.
+
+**Setup.** Qwen-Image 2.1 BF16 checkpoint (revision `790c9263`), NVIDIA GeForce
+RTX 5090 (32 GB), torch 2.13.0, 1024x1024, 40 steps, guidance 1.0, CPU
+generator, `torch_sdpa`, DiT layerwise offload, no compile or CUDA graphs. The
+native baseline is the same SGLang build with no `dpcache_schedule`. Schedules
+were calibrated on 10 prompts, the budget was selected on 8 different prompts,
+and the selection was frozen before 20 held-out prompt and seed pairs (10
+prompts x 2 seeds) were generated once. All three splits are prompt-disjoint.
+
+**Exactness.** Without a schedule, and with an all-full (`K=40`) schedule,
+final latents, decoded tensors, and PNGs were bit-identical (`torch.equal`) to
+an export of the unmodified source commit on every compared request. That held
+across repeated requests and after a request that failed schedule validation.
+No schedule with `K < 40` produced a bit-identical output.
+
+**Quality and speed (held-out, 20 pairs).** LPIPS is AlexNet LPIPS on
+white-composited RGBA against the native output of the same prompt and seed.
+Time is the client wall-clock time of a warm end-to-end generation (encode,
+denoise, decode, offload transfers), measured in randomized paired blocks, 3
+repeats x 4 pairs.
+
+| Schedule | Mean LPIPS | Max LPIPS | Max alpha error | Seconds per image | Speedup |
+| --- | --- | --- | --- | --- | --- |
+| Native (40 full steps) | 0 | 0 | 0 | 13.46 | 1.00x |
+| `K=20` | 0.0085 | 0.041 | 0.110 | 6.85 | 1.97x |
+| `K=12` | 0.070 | 0.150 | 0.227 | 4.20 | 3.21x |
+
+Validation (8 pairs, one timing repeat) covered every budget:
+
+| `K` | 39 | 36 | 32 | 28 | 24 | 20 | 16 | 12 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Mean LPIPS | 0.0006 | 0.0009 | 0.0013 | 0.0025 | 0.0043 | 0.0096 | 0.039 | 0.096 |
+| Max LPIPS | 0.0010 | 0.0014 | 0.0027 | 0.0046 | 0.0104 | 0.032 | 0.130 | 0.235 |
+| Speedup | 1.03x | 1.11x | 1.24x | 1.42x | 1.65x | 1.97x | 2.44x | 3.21x |
+
+Wall-clock time scales almost linearly with `K`: a predicted step costs little
+more than the per-step preparation and the output head. With layerwise offload,
+predicted steps loaded no block weights (0 layer loads over 960 predicted
+held-out steps), and each full step streamed all 32 blocks.
+
+<Warning>
+A passing mean LPIPS does not guarantee that each image is preserved. On the
+held-out set, `K=12` visibly changed the layout of some scenes and turned one
+of four colored cups into a different object. `K=20` stayed visually close on
+every held-out pair. Inspect side-by-side images before choosing a budget.
+</Warning>
+
+**Cost.** Calibration took 140.6 GPU-seconds of feature capture plus 15.1
+GPU-seconds of error scoring and 0.04 CPU-seconds of planning. Model loading is
+excluded. That amortizes after about 17 images at `K=12` or 24 at `K=20`.
+Counting the validation sweep (about 1,430 GPU-seconds) as well, break-even is
+about 171 and 240 images.
+
+## Compared with the other cache strategies
+
+This section reports one small measured comparison of the cache strategies SGLang already ships
+for Qwen-Image 2.1, on the same recipe as above (40 scheduler updates, BF16, 1024x1024, guidance
+1.0, one RTX 5090). It is preliminary evidence from 20 held-out prompt and seed pairs, not a
+general ranking. Cache-DiT presets are the stock knobs plus one conservative preset; `uniform-K12`
+and `uniform-K20` share DPCache's runtime, budget, mandatory prefix and last full step, and differ
+only in where the interior full steps sit, which isolates the effect of the calibrated placement.
+
+Time is allocated GPU-seconds per image, measured in grouped same-config repeats (3 repeats x 4
+distinct prompts), which is what a steady single-config service sees. LPIPS is AlexNet LPIPS on
+white-composited RGBA against native output for the same prompt and seed. "Blocks" counts real
+transformer-block invocations per image; native runs 40 x 32 = 1280.
+
+| Arm | Blocks | LPIPS mean | LPIPS max | GPU s/image | vs native |
+| --- | --- | --- | --- | --- | --- |
+| Native | 1280 | 0 | 0 | 13.457 | 1.00x |
+| DPCache `K=12` | 384 | 0.085 | 0.220 | 4.197 | 3.21x |
+| Uniform `K=12` control | 384 | 0.155 | 0.280 | 4.196 | 3.21x |
+| Cache-DiT stock | 443 | 0.102 | 0.176 | 4.979 | 2.70x |
+| DPCache `K=20` | 640 | 0.008 | 0.035 | 6.845 | 1.97x |
+| Uniform `K=20` control | 640 | 0.070 | 0.208 | 6.844 | 1.97x |
+| Cache-DiT conservative | 710 | 0.016 | 0.042 | 7.678 | 1.75x |
+
+What the measurements say on this workload:
+
+- At the stricter reading (`mean <= 0.05` and `max <= 0.10`), `K=20` and the conservative Cache-DiT
+  preset both qualify; `K=20` used 10.9 % less GPU time and had the lower mean and max LPIPS.
+- At the looser reading (`mean <= 0.18` and `max <= 0.30`), `K=12` used 15.7 % less GPU time than
+  stock Cache-DiT and had the lower mean LPIPS, but a **worse worst case** (0.220 vs 0.176). Pick
+  by whether mean or worst-case fidelity matters more for your workload.
+- The uniform controls cost the same time as their DPCache counterparts and are clearly further
+  from native, and `uniform-K20` misses the stricter reading that `K=20` meets.
+- Equal scheduler updates are not equal compute: the Cache-DiT arms ran 15.4 % and 10.9 % more
+  transformer blocks than the DPCache arms they are compared against, so GPU-seconds is the
+  comparison here and no equal-compute claim is made.
+- `enable_teacache` is currently a no-op on Qwen-Image 2.1: the request is accepted, all 1280
+  blocks still run, and the output is bit-identical to native. There is no TeaCache adapter for
+  this model, so it provides no acceleration to compare.
+
+Caveats: 20 held-out pairs and 4 timing prompts on one GPU and one checkpoint; the two LPIPS
+readings are this study's policy rather than published thresholds; no accelerated arm is
+bit-identical to native; and the RGBA policy is provisional, so alpha-dropped LPIPS and alpha
+error are reported separately and not gated (`uniform-K12` and stock Cache-DiT showed the largest
+alpha deviation, about 0.28-0.29).
+
+`python/sglang/multimodal_gen/benchmarks/bench_qwen_image21_cache_comparison.py` reproduces this
+comparison. It reuses the DPCache benchmark for scoring and contact sheets, counts the real blocks
+even while Cache-DiT wraps them, and refuses to freeze or reuse a configuration that differs from
+the one it validated:
+
+```bash
+COMP=python/sglang/multimodal_gen/benchmarks/bench_qwen_image21_cache_comparison.py
+
+# Endpoint-matched uniform controls from frozen DPCache artifacts.
+PYTHONPATH=python python $COMP schedules --schedule-dir SCHEDULES --out schedules-uniform \
+  --source-commit COMMIT --pact-errors SCHEDULES/pact-errors.npz
+
+# Exactness controls: every mode, native after each one, plus a failing request.
+PYTHONPATH=python python $COMP launch controls --corpus CORPUS --split controls \
+  --out runs/controls --model-path MODEL_PATH --source-dir python \
+  --schedule-dir schedules-uniform --gpu-lock LOCK
+
+# Held-out comparison with a frozen selection; grouped timing is the primary regime.
+PYTHONPATH=python python $COMP launch heldout --corpus CORPUS --split heldout \
+  --out runs/heldout --model-path MODEL_PATH --source-dir python \
+  --schedule-dir schedules-uniform --selection selection.json \
+  --arms native dp-K12 dp-K20 uniform-K12 uniform-K20 cachedit-stock cachedit-conservative \
+  --timing-repeats 1 --service-repeats 3 --timing-pair-indices 0 6 12 18 --gpu-lock LOCK
+PYTHONPATH=python python $COMP report --run runs/heldout \
+  --scores runs/heldout/scores.json --out runs/heldout/report.json
+```
+
+<Note>
+All-full controls are the load-bearing check for any of these comparisons: with DPCache scheduling
+every step full, with the uniform control at `K=40`, and with Cache-DiT forced to compute every
+block, output stayed bit-identical to unmodified SGLang. That is what makes the differences above
+attributable to caching rather than to the integration.
+</Note>
