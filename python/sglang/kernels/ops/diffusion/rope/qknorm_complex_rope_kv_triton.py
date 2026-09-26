@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Write normalized/rotated K and unmodified V into their final prefix buffers."""
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -34,6 +36,9 @@ def _qknorm_complex_rope_kv_kernel(
     EPS: tl.constexpr,
     FUSE_REAL_SIN: tl.constexpr,
     PACK_V: tl.constexpr,
+    row_scale_ptr=None,
+    col_scale_ptr=None,
+    HAS_SCALE: tl.constexpr = False,
 ):
     # PACK_V=False packs K only; V then goes to its consumer by another route.
     pid = tl.program_id(0)
@@ -51,6 +56,9 @@ def _qknorm_complex_rope_kv_kernel(
             K_TOKEN_STRIDE,
             EPS,
             FUSE_REAL_SIN,
+            row_scale_ptr,
+            col_scale_ptr,
+            HAS_SCALE,
         )
         out_row = row + (row // (SEQ * HEADS) + 1) * PREFIX * HEADS
         output_index = out_row[:, None] * 128 + column[None, :]
@@ -150,7 +158,9 @@ def can_use_qknorm_complex_rope_k(k, weight, rope, k_prefix):
     return can_use_qknorm_complex_rope_kv(k, weight, rope, k, k_prefix, k_prefix)
 
 
-def _fake_qknorm_complex_rope_k(k, weight, rope, k_prefix, eps):
+def _fake_qknorm_complex_rope_k(
+    k, weight, rope, k_prefix, eps, row_scale=None, col_scale=None
+):
     return _fake_qknorm_complex_rope_kv(k, weight, rope, k, k_prefix, k_prefix, eps)[0]
 
 
@@ -165,9 +175,19 @@ def qknorm_complex_rope_k(
     rope: torch.Tensor,
     k_prefix: torch.Tensor,
     eps: float,
+    row_scale: Optional[torch.Tensor] = None,
+    col_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """The K half of qknorm_complex_rope_kv: ``[k_prefix; RMSNorm+RoPE(k)]``."""
+    """The K half of qknorm_complex_rope_kv: ``[k_prefix; RMSNorm+RoPE(k)]``.
+
+    With ``row_scale`` [batch * seq] and ``col_scale`` [heads * 128], k is an
+    unscaled FP8 GEMM product and ``bf16(k * (row_scale[token] *
+    col_scale[channel]))``, rounded as the GEMM route's scale pass rounds it, is
+    normalized instead; k_prefix is already scaled.
+    """
     assert can_use_qknorm_complex_rope_k(k, weight, rope, k_prefix)
+    has_scale = row_scale is not None
+    assert has_scale == (col_scale is not None)
     kout = _fake_qknorm_complex_rope_k(k, weight, rope, k_prefix, eps)
     batch, seq, heads, dim = k.shape
     prefix = k_prefix.shape[1]
@@ -196,6 +216,9 @@ def qknorm_complex_rope_k(
             eps,
             _fuse_real_sin(k.device),
             False,
+            row_scale if has_scale else k,
+            col_scale if has_scale else k,
+            has_scale,
             num_warps=4,
             enable_fp_fusion=False,
         )

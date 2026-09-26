@@ -41,6 +41,34 @@ def _silu_mul_kernel(
 
 
 @triton.jit
+def _scaled_silu_mul_kernel(
+    out_ptr,
+    a_ptr,
+    b_ptr,
+    row_scale_ptr,
+    a_col_scale_ptr,
+    b_col_scale_ptr,
+    N,
+    BLOCK_N: tl.constexpr,
+):
+    # a and b are unscaled FP8 GEMM products [M, N]; scale and round them to
+    # bf16 exactly as the GEMM route's scale pass (x * (sa * sb)) would, then
+    # round as the eager silu / multiply chain does.
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = cols < N
+    row_scale = tl.load(row_scale_ptr + row)
+    a_scale = tl.load(a_col_scale_ptr + cols, mask=mask, other=0.0)
+    b_scale = tl.load(b_col_scale_ptr + cols, mask=mask, other=0.0)
+    a = tl.load(a_ptr + row * N + cols, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(b_ptr + row * N + cols, mask=mask, other=0.0).to(tl.float32)
+    a = (a * (row_scale * a_scale)).to(out_ptr.dtype.element_ty).to(tl.float32)
+    b = (b * (row_scale * b_scale)).to(out_ptr.dtype.element_ty).to(tl.float32)
+    s = round_bf16_to_fp32(a * tl.sigmoid(a))
+    tl.store(out_ptr + row * N + cols, s * b, mask=mask)
+
+
+@triton.jit
 def _packed_silu_mul_kernel(
     out_ptr,
     x_ptr,
@@ -94,6 +122,43 @@ def fused_silu_mul_bitexact(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             b,
             numel,
             BLOCK=1024,
+        )
+    return out
+
+
+def can_use_fused_scaled_silu_mul(a, b, row_scale, a_col_scale, b_col_scale) -> bool:
+    return (
+        can_use_fused_silu_mul(a, b)
+        and a.dim() == 2
+        and all(
+            x.is_cuda and x.dtype is torch.float32 and x.is_contiguous()
+            for x in (row_scale, a_col_scale, b_col_scale)
+        )
+        and row_scale.numel() == a.shape[0]
+        and a_col_scale.numel() == b_col_scale.numel() == a.shape[1]
+    )
+
+
+def fused_scaled_silu_mul(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    row_scale: torch.Tensor,
+    a_col_scale: torch.Tensor,
+    b_col_scale: torch.Tensor,
+) -> torch.Tensor:
+    """``silu(a') * b'`` with ``x' = bf16(x * (row_scale[m] * x_col_scale[n]))``.
+
+    a and b are [M, N] unscaled FP8 GEMM products (the SM120 cuBLASLt route's
+    deferred scale). x' is rounded as the route's scale pass rounds it, so the
+    result is bitwise equal to fused_silu_mul_bitexact of the scaled GEMMs.
+    """
+    assert can_use_fused_scaled_silu_mul(a, b, row_scale, a_col_scale, b_col_scale)
+    m, n = a.shape
+    out = torch.empty_like(a)
+    block_n = 1024
+    with torch.cuda.device(a.device):
+        _scaled_silu_mul_kernel[(m, triton.cdiv(n, block_n))](
+            out, a, b, row_scale, a_col_scale, b_col_scale, n, BLOCK_N=block_n
         )
     return out
 

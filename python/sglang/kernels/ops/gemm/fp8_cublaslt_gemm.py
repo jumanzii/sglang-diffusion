@@ -116,6 +116,36 @@ def _scale_rows_cols_kernel(
 
 
 @register_custom_op(
+    op_name="fp8_unit_scale_gemm_cublaslt",
+    mutates_args=["out"],
+)
+def _fp8_unit_scale_gemm_cublaslt_op(
+    out: torch.Tensor, mat_a: torch.Tensor, w_nk: torch.Tensor
+) -> None:
+    module = _jit_module()
+    workspace = _workspace(mat_a.device.index or 0)
+    module.gemm(
+        out, mat_a, w_nk, workspace, _select_algo(module, out, mat_a, w_nk, workspace)
+    )
+
+
+@debug_kernel_api
+def fp8_unit_scale_gemm_cublaslt(
+    mat_a: torch.Tensor, w_nk: torch.Tensor
+) -> torch.Tensor:
+    """bf16 out[M, N] = mat_a[M, K] @ w_nk[N, K]^T (e4m3, fp32 accumulation, unit scales).
+
+    The caller owns the per-token and per-channel scales; see
+    apply_fp8_linear_deferred_scale.
+    """
+    out = torch.empty(
+        (mat_a.shape[0], w_nk.shape[0]), dtype=torch.bfloat16, device=mat_a.device
+    )
+    _fp8_unit_scale_gemm_cublaslt_op(out, mat_a, w_nk)
+    return out
+
+
+@register_custom_op(
     op_name="fp8_per_channel_scaled_mm_cublaslt",
     mutates_args=["out"],
 )

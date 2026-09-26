@@ -21,9 +21,13 @@ def _qknorm_complex_rope_rows(
     TOKEN_STRIDE: tl.constexpr,
     EPS: tl.constexpr,
     FUSE_REAL_SIN: tl.constexpr,
+    row_scale_ptr=None,
+    col_scale_ptr=None,
+    HAS_SCALE: tl.constexpr = False,
 ):
     # A row is one head of one token: 128 contiguous values, with tokens
     # TOKEN_STRIDE elements apart (HEADS * 128 when x is contiguous).
+    # HAS_SCALE=False compiles to the unscaled row function unchanged.
     # Four rows / four warps gives each lane four consecutive components.
     # Match aten's vectorized 128-wide FP32 mean: combine four components
     # left-to-right, then reduce 32 lanes with decreasing shuffle offsets.
@@ -32,6 +36,21 @@ def _qknorm_complex_rope_rows(
     mask = row[:, None] < ROWS
     offset = row // HEADS * TOKEN_STRIDE + row % HEADS * 128
     value = tl.load(x_ptr + offset[:, None] + column[None, :], mask, 0).to(tl.float32)
+    if HAS_SCALE:
+        # x holds an unscaled FP8 GEMM product: apply the per-token (row_scale,
+        # indexed by batch * SEQ + token) and per-channel (col_scale, indexed by
+        # head * 128 + column) scales and round to x's dtype, bit for bit as the
+        # GEMM route's scale pass (x * (sa * sb)) does.
+        token_scale = tl.load(row_scale_ptr + row // HEADS, row < ROWS, 0.0)
+        channel = row % HEADS * 128
+        channel_scale = tl.load(
+            col_scale_ptr + channel[:, None] + column[None, :], mask, 0.0
+        )
+        value = (
+            (value * (token_scale[:, None] * channel_scale))
+            .to(x_ptr.dtype.element_ty)
+            .to(tl.float32)
+        )
     square = tl.reshape(value * value, (4, 32, 2, 2))
     even, odd = tl.split(square)
     a, c = tl.split(even)

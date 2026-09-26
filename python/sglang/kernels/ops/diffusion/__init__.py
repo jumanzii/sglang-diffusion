@@ -615,6 +615,8 @@ _EXPORTS: dict[str, str] = {
     "fused_bias_glu": "activation.sana_conv_post_triton",
     "fused_bias_silu": "activation.sana_conv_post_triton",
     "can_use_fused_silu_mul": "activation.silu_mul_bitexact",
+    "can_use_fused_scaled_silu_mul": "activation.silu_mul_bitexact",
+    "fused_scaled_silu_mul": "activation.silu_mul_bitexact",
     "fused_packed_silu_mul_bitexact": "activation.silu_mul_bitexact",
     "fused_silu_mul_bitexact": "activation.silu_mul_bitexact",
     # Diffusion attention kernels

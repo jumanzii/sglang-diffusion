@@ -39,6 +39,7 @@ from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    apply_fp8_linear_deferred_scale,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
@@ -381,6 +382,24 @@ class Fp8LinearMethod(LinearMethodBase):
             prepare_fp8_layer_for_marlin(layer, not self.block_quant)
             # Activations not quantized for marlin.
             del layer.input_scale
+
+    def apply_deferred_scale(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        quantized_input=None,
+    ):
+        """apply() without the output scaling, for consumers that fuse it, or None.
+
+        See apply_fp8_linear_deferred_scale: returns ``(unscaled, row_scale,
+        col_scale, quantized_input)`` on SM120's cuBLASLt per-channel route
+        (dynamic per-token activations, no marlin / block quantization).
+        """
+        if self.use_marlin or self.block_quant or layer.input_scale is not None:
+            return None
+        return apply_fp8_linear_deferred_scale(
+            x.contiguous(), layer.weight, layer.weight_scale, quantized_input
+        )
 
     def apply(
         self,
