@@ -19,6 +19,10 @@ from sglang.kernels.ops.diffusion import (
     rmsnorm_preserve_reduction,
     tensors_equal,
 )
+from sglang.kernels.ops.diffusion.attention.sageattn_prequant_triton import (
+    can_use_sage_prequant_attention,
+    sage_prequant_attention,
+)
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
     can_use_qknorm_complex_rope_kv,
     qknorm_complex_rope_kv,
@@ -58,6 +62,9 @@ _QK_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm + complex RoPE"
 _KV_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 K RMSNorm + RoPE + KV packing")
 _QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
+_SAGE_PREQUANT_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 SageAttention2 operands from the Q/K/V kernels"
+)
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -335,6 +342,37 @@ class QwenImage21Attention(nn.Module):
             prefix_output = self.to_out[0](torch.cat(outputs, dim=1).flatten(2))[0]
             if cache is not None:
                 cache.update(key=kp, value=vp)
+        if (
+            get_sp_world_size() == 1
+            and self.target_attn.backend == AttentionBackendEnum.SAGE_ATTN
+            and can_use_sage_prequant_attention(
+                q, self.norm_q.weight, k, self.norm_k.weight, rope, v, kp, vp
+            )
+            and _SAGE_PREQUANT_FUSION.can_attempt_once()
+        ):
+            fused = sage_prequant_attention(
+                q,
+                self.norm_q.weight,
+                self.norm_q.variance_epsilon,
+                k,
+                self.norm_k.weight,
+                self.norm_k.variance_epsilon,
+                rope,
+                v,
+                kp,
+                vp,
+                self.target_attn.softmax_scale,
+            )
+            if _SAGE_PREQUANT_FUSION.verified:
+                return fused, prefix_output
+            reference = self.attend_target(q, k, v, rope, kp, vp)
+            out = _SAGE_PREQUANT_FUSION.accept_or_fallback(
+                fused, reference, logger=logger
+            )
+            return out, prefix_output
+        return self.attend_target(q, k, v, rope, kp, vp), prefix_output
+
+    def attend_target(self, q, k, v, rope, kp, vp):
         q = apply_qk_norm_rope(q, self.norm_q, rope)
         packed = None
         if (
@@ -357,11 +395,9 @@ class QwenImage21Attention(nn.Module):
                     logger=logger,
                 )
         if packed is not None:
-            out = self.target_attn(q, *packed)
-        else:
-            k = apply_qk_norm_rope(k, self.norm_k, rope)
-            out = self.target_attn.forward_with_replicated_kv_prefix(q, kp, vp, k, v)
-        return out, prefix_output
+            return self.target_attn(q, *packed)
+        k = apply_qk_norm_rope(k, self.norm_k, rope)
+        return self.target_attn.forward_with_replicated_kv_prefix(q, kp, vp, k, v)
 
     def forward(self, x, ropes, prefixes, layouts, caches):
         # batch target projections while retaining each sample's unpadded prefix

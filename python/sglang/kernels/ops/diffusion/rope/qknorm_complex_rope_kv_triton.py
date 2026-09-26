@@ -33,7 +33,9 @@ def _qknorm_complex_rope_kv_kernel(
     BATCH: tl.constexpr,
     EPS: tl.constexpr,
     FUSE_REAL_SIN: tl.constexpr,
+    PACK_V: tl.constexpr,
 ):
+    # PACK_V=False packs K only; V then goes to its consumer by another route.
     pid = tl.program_id(0)
     if pid < tl.cdiv(ROWS, 4):
         row = pid * 4 + tl.arange(0, 4)
@@ -54,17 +56,19 @@ def _qknorm_complex_rope_kv_kernel(
         output_index = out_row[:, None] * 128 + column[None, :]
         mask = row[:, None] < ROWS
         tl.store(kout_ptr + output_index, key, mask)
-        v_offset = row // HEADS * V_TOKEN_STRIDE + row % HEADS * 128
-        value = tl.load(v_ptr + v_offset[:, None] + column[None, :], mask, 0)
-        tl.store(vout_ptr + output_index, value, mask)
+        if PACK_V:
+            v_offset = row // HEADS * V_TOKEN_STRIDE + row % HEADS * 128
+            value = tl.load(v_ptr + v_offset[:, None] + column[None, :], mask, 0)
+            tl.store(vout_ptr + output_index, value, mask)
     else:
         index = (pid - tl.cdiv(ROWS, 4)) * 1024 + tl.arange(0, 1024)
         prefix_mask = index < BATCH * PREFIX * HEADS * 128
         prefix_index = index + (index // (PREFIX * HEADS * 128)) * SEQ * HEADS * 128
         prefix_key = tl.load(kp_ptr + index, prefix_mask, 0)
-        prefix_value = tl.load(vp_ptr + index, prefix_mask, 0)
         tl.store(kout_ptr + prefix_index, prefix_key, prefix_mask)
-        tl.store(vout_ptr + prefix_index, prefix_value, prefix_mask)
+        if PACK_V:
+            prefix_value = tl.load(vp_ptr + index, prefix_mask, 0)
+            tl.store(vout_ptr + prefix_index, prefix_value, prefix_mask)
 
 
 def can_use_qknorm_complex_rope_kv(k, weight, rope, v, k_prefix, v_prefix):
@@ -135,7 +139,64 @@ def qknorm_complex_rope_kv(
             batch,
             eps,
             _fuse_real_sin(k.device),
+            True,
             num_warps=4,
             enable_fp_fusion=False,
         )
     return kout, vout
+
+
+def can_use_qknorm_complex_rope_k(k, weight, rope, k_prefix):
+    return can_use_qknorm_complex_rope_kv(k, weight, rope, k, k_prefix, k_prefix)
+
+
+def _fake_qknorm_complex_rope_k(k, weight, rope, k_prefix, eps):
+    return _fake_qknorm_complex_rope_kv(k, weight, rope, k, k_prefix, k_prefix, eps)[0]
+
+
+@register_custom_op(
+    op_name="qknorm_complex_rope_k",
+    mutates_args=[],
+    fake_impl=_fake_qknorm_complex_rope_k,
+)
+def qknorm_complex_rope_k(
+    k: torch.Tensor,
+    weight: torch.Tensor,
+    rope: torch.Tensor,
+    k_prefix: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """The K half of qknorm_complex_rope_kv: ``[k_prefix; RMSNorm+RoPE(k)]``."""
+    assert can_use_qknorm_complex_rope_k(k, weight, rope, k_prefix)
+    kout = _fake_qknorm_complex_rope_k(k, weight, rope, k_prefix, eps)
+    batch, seq, heads, dim = k.shape
+    prefix = k_prefix.shape[1]
+    with torch.cuda.device(k.device):
+        _qknorm_complex_rope_kv_kernel[
+            (
+                triton.cdiv(batch * seq * heads, 4)
+                + triton.cdiv(batch * prefix * heads * dim, 1024),
+            )
+        ](
+            k,
+            weight,
+            torch.view_as_real(rope),
+            k,
+            k_prefix,
+            k_prefix,
+            kout,
+            kout,
+            batch * seq * heads,
+            seq,
+            heads,
+            token_stride(k),
+            token_stride(k),
+            prefix,
+            batch,
+            eps,
+            _fuse_real_sin(k.device),
+            False,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return kout
