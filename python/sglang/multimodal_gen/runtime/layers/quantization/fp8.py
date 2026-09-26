@@ -40,6 +40,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_linear_deferred_scale,
+    apply_fp8_linear_per_token_quantized,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
@@ -399,6 +400,24 @@ class Fp8LinearMethod(LinearMethodBase):
             return None
         return apply_fp8_linear_deferred_scale(
             x.contiguous(), layer.weight, layer.weight_scale, quantized_input
+        )
+
+    def apply_per_token_quantized(
+        self,
+        layer: torch.nn.Module,
+        qinput: torch.Tensor,
+        x_scale: torch.Tensor,
+    ):
+        """apply() for an input already quantized per token by its producer, or None.
+
+        See apply_fp8_linear_per_token_quantized: the same output apply()
+        returns for the unquantized input on SM120's cuBLASLt per-channel
+        route (dynamic per-token activations, no marlin / block quantization).
+        """
+        if self.use_marlin or self.block_quant or layer.input_scale is not None:
+            return None
+        return apply_fp8_linear_per_token_quantized(
+            qinput, x_scale, layer.weight, layer.weight_scale
         )
 
     def apply(

@@ -23,6 +23,9 @@ import triton.language as tl  # type: ignore
 from sglang.kernels.ops.diffusion.common.numerics import round_bf16_to_fp32
 from sglang.srt.utils.custom_op import register_custom_op
 
+# One program holds a whole row in registers (fp32), so rows are bounded.
+_FP8_ROW_MAX = 16384
+
 
 @triton.jit
 def _silu_mul_kernel(
@@ -66,6 +69,41 @@ def _scaled_silu_mul_kernel(
     b = (b * (row_scale * b_scale)).to(out_ptr.dtype.element_ty).to(tl.float32)
     s = round_bf16_to_fp32(a * tl.sigmoid(a))
     tl.store(out_ptr + row * N + cols, s * b, mask=mask)
+
+
+@triton.jit
+def _scaled_silu_mul_fp8_kernel(
+    q_ptr,
+    q_scale_ptr,
+    a_ptr,
+    b_ptr,
+    row_scale_ptr,
+    a_col_scale_ptr,
+    b_col_scale_ptr,
+    N,
+    BLOCK_N: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    # One program holds one whole row: the per-token scale needs the row's
+    # absolute maximum before any element is quantized.
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < N
+    row_scale = tl.load(row_scale_ptr + row)
+    a_scale = tl.load(a_col_scale_ptr + cols, mask=mask, other=0.0)
+    b_scale = tl.load(b_col_scale_ptr + cols, mask=mask, other=0.0)
+    a = tl.load(a_ptr + row * N + cols, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(b_ptr + row * N + cols, mask=mask, other=0.0).to(tl.float32)
+    a = round_bf16_to_fp32(a * (row_scale * a_scale))
+    b = round_bf16_to_fp32(b * (row_scale * b_scale))
+    hidden = round_bf16_to_fp32(round_bf16_to_fp32(a * tl.sigmoid(a)) * b)
+    # per_token_quant_fp8_warp_kernel's arithmetic (IEEE divisions, no
+    # fast-math in the JIT build): scale = amax / 448, x * (1 / scale).
+    scale = tl.math.div_rn(tl.max(tl.abs(hidden), 0), FP8_MAX)
+    tl.store(q_scale_ptr + row, scale)
+    inverse = tl.where(scale == 0.0, 0.0, tl.math.div_rn(1.0, scale))
+    quantized = tl.clamp(hidden * inverse, -FP8_MAX, FP8_MAX)
+    tl.store(q_ptr + row * N + cols, quantized.to(q_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -161,6 +199,53 @@ def fused_scaled_silu_mul(
             out, a, b, row_scale, a_col_scale, b_col_scale, n, BLOCK_N=block_n
         )
     return out
+
+
+def can_use_fused_scaled_silu_mul_fp8(
+    a, b, row_scale, a_col_scale, b_col_scale
+) -> bool:
+    return (
+        can_use_fused_scaled_silu_mul(a, b, row_scale, a_col_scale, b_col_scale)
+        and a.dtype is torch.bfloat16
+        and a.shape[1] <= _FP8_ROW_MAX
+    )
+
+
+def fused_scaled_silu_mul_fp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    row_scale: torch.Tensor,
+    a_col_scale: torch.Tensor,
+    b_col_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``sglang_per_token_quant_fp8(fused_scaled_silu_mul(...))`` in one pass.
+
+    Returns ``(q [M, N] float8_e4m3fn, q_scale [M, 1] fp32)``, bitwise what the
+    bf16 SiLU-mul followed by the per-token FP8 quantization of the next
+    linear's input produces, without writing the bf16 intermediate. An
+    all-zero row quantizes to zeros with scale 0, as the quantization's warp
+    kernel does; its small-batch CTA kernel has no zero-scale guard.
+    """
+    assert can_use_fused_scaled_silu_mul_fp8(a, b, row_scale, a_col_scale, b_col_scale)
+    m, n = a.shape
+    q = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=a.device)
+    q_scale = torch.empty((m, 1), dtype=torch.float32, device=a.device)
+    block_n = triton.next_power_of_2(n)
+    with torch.cuda.device(a.device):
+        _scaled_silu_mul_fp8_kernel[(m,)](
+            q,
+            q_scale,
+            a,
+            b,
+            row_scale,
+            a_col_scale,
+            b_col_scale,
+            n,
+            BLOCK_N=block_n,
+            FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+            num_warps=16,
+        )
+    return q, q_scale
 
 
 def fused_packed_silu_mul_bitexact(x: torch.Tensor) -> torch.Tensor:

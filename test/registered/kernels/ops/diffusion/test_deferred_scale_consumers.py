@@ -11,6 +11,7 @@ import torch
 
 from sglang.kernels.ops.diffusion.activation.silu_mul_bitexact import (
     fused_scaled_silu_mul,
+    fused_scaled_silu_mul_fp8,
     fused_silu_mul_bitexact,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -48,6 +49,30 @@ def test_scaled_silu_mul(unit, m, n):
         _apply(a, row_scale, a_col), _apply(b, row_scale, b_col)
     )
     assert torch.equal(out, reference)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("unit", [True, False])
+@pytest.mark.parametrize("m, n", [(4096, 12288), (1500, 4096), (3, 100)])
+def test_scaled_silu_mul_fp8_matches_per_token_quant(unit, m, n):
+    from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
+
+    torch.manual_seed(0)
+    a = (torch.randn(m, n, device="cuda") * 300).to(torch.bfloat16)
+    b = (torch.randn(m, n, device="cuda") * 300).to(torch.bfloat16)
+    if m >= torch.cuda.get_device_properties(0).multi_processor_count * 16:
+        # All-zero row: scale 0, as the warp kernel the reference uses at this
+        # size handles it (its small-batch CTA kernel does not guard it).
+        a[0] = 0
+    a[-1, :4] = 3e4  # large values that clamp to the e4m3 range
+    row_scale, a_col = _scales(m, n, unit)
+    _, b_col = _scales(m, n, unit)
+    q, q_scale = fused_scaled_silu_mul_fp8(a, b, row_scale, a_col, b_col)
+    ref_q, ref_scale = sglang_per_token_quant_fp8(
+        fused_scaled_silu_mul(a, b, row_scale, a_col, b_col)
+    )
+    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(q_scale, ref_scale)
 
 
 sage_available = (

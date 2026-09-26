@@ -2090,6 +2090,33 @@ def apply_fp8_linear_deferred_scale(
     )
 
 
+def apply_fp8_linear_per_token_quantized(
+    qinput: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """apply_fp8_linear's SM120 cuBLASLt route for an input its producer has
+    already quantized per token (as sglang_per_token_quant_fp8 would), or None.
+
+    ``qinput`` is [M, K] e4m3 and ``x_scale`` [M, 1] fp32. None whenever
+    apply_fp8_linear would not take the cuBLASLt route; the caller then runs
+    the plain linear on the unquantized input.
+    """
+    if not (
+        _is_cuda
+        and get_platform().is_sm120
+        and envs.SGLANG_ENABLE_SM120_FP8_CUBLASLT_GEMM.get()
+        and qinput.dtype == torch.float8_e4m3fn
+        and weight.dtype == torch.float8_e4m3fn
+        and weight_scale.numel() == weight.shape[1]
+    ):
+        return None
+    return maybe_fp8_per_channel_scaled_mm_cublaslt(
+        qinput, weight, x_scale, weight_scale, out_dtype=torch.bfloat16
+    )
+
+
 def apply_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,

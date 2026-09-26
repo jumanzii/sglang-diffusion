@@ -11,11 +11,13 @@ from sglang.kernels.ops.diffusion import (
     can_use_fused_complex_rope,
     can_use_fused_layernorm_modulate,
     can_use_fused_scaled_silu_mul,
+    can_use_fused_scaled_silu_mul_fp8,
     can_use_fused_silu_mul,
     can_use_rmsnorm_preserve_reduction,
     fused_complex_rope,
     fused_layernorm_modulate,
     fused_scaled_silu_mul,
+    fused_scaled_silu_mul_fp8,
     fused_silu_mul_bitexact,
     residual_gate_add,
     rmsnorm_preserve_reduction,
@@ -33,6 +35,7 @@ from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
     can_use_qknorm_complex_rope,
     qknorm_complex_rope,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_world_size,
@@ -73,6 +76,9 @@ _QKV_SCALE_FUSION = BitExactFusionGate(
 )
 _FFN_SCALE_FUSION = BitExactFusionGate(
     "Qwen-Image 2.1 gate/up FP8 GEMM scale pass in the SiLU-mul"
+)
+_DOWN_INPUT_QUANT_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 down-projection FP8 input quantization in the SiLU-mul"
 )
 
 
@@ -251,6 +257,31 @@ def _deferred_scale_linear(linear, x, quantized_input=None):
     return linear.quant_method.apply_deferred_scale(linear, x, quantized_input)
 
 
+def _takes_per_token_quantized_input(linear):
+    """Whether linear can consume an input its producer quantized per token."""
+    return (
+        type(linear) is RowParallelLinear
+        and linear.bias is None
+        and get_tp_world_size() == 1
+        and isinstance(linear.quant_method, Fp8LinearMethod)
+    )
+
+
+def _uses_per_token_quant_warp_kernel(tokens, device):
+    """Whether sglang_per_token_quant_fp8 takes its warp kernel for this many
+    tokens (per_token_quant_fp8.cuh: at least 2 x SMs x 8). The CTA kernel it
+    uses below that has no zero-scale guard, so an all-zero row there comes out
+    as 448 instead of 0; the fused SiLU-mul reproduces the warp kernel only."""
+    return tokens >= torch.cuda.get_device_properties(device).multi_processor_count * 16
+
+
+def _quantized_equal(a, b):
+    """Bitwise equality of two (FP8 values, fp32 scales) pairs."""
+    return torch.equal(a[0].view(torch.uint8), b[0].view(torch.uint8)) and torch.equal(
+        a[1], b[1]
+    )
+
+
 def _scale_qkv_view(t, row_scale, col_scale):
     """A [B, S, H, D] view of an unscaled GEMM product, scaled and rounded to
     bf16 as the GEMM route's scale pass does: ``bf16(x * (sa * sb))``."""
@@ -289,8 +320,8 @@ class QwenImage21FeedForward(nn.Module):
             prefix=f"{prefix}.out",
         )
 
-    def _deferred_silu_mul(self, x):
-        """silu(gate) * value from unscaled gate/value GEMMs, or None.
+    def _deferred_mlp(self, x):
+        """out(silu(gate) * value) from unscaled gate/value GEMMs, or None.
 
         Both GEMMs share one quantization of x; the scaled SiLU-mul applies
         their scales on load with the scale pass's rounding. Runs once the
@@ -306,22 +337,50 @@ class QwenImage21FeedForward(nn.Module):
         args = (gate[0], value[0], gate[1], gate[2], value[2])
         if not can_use_fused_scaled_silu_mul(*args):
             return None
-        hidden = fused_scaled_silu_mul(*args)
-        if not _FFN_SCALE_FUSION.verified:
-            reference = fused_silu_mul_bitexact(
-                _scale_rows_cols(gate[0], gate[1], gate[2]),
-                _scale_rows_cols(value[0], value[1], value[2]),
+        out = self._silu_mul_fp8_down(args)
+        if out is None:
+            hidden = fused_scaled_silu_mul(*args)
+            if not _FFN_SCALE_FUSION.verified:
+                reference = fused_silu_mul_bitexact(
+                    _scale_rows_cols(gate[0], gate[1], gate[2]),
+                    _scale_rows_cols(value[0], value[1], value[2]),
+                )
+                hidden = _FFN_SCALE_FUSION.accept_or_fallback(
+                    hidden, reference, logger=logger
+                )
+            out = self.out(hidden)[0]
+        return out.view(*x.shape[:-1], out.shape[-1])
+
+    def _silu_mul_fp8_down(self, args):
+        """The down linear fed by a SiLU-mul that writes its FP8 input, or None.
+
+        The SiLU-mul emits the per-token FP8 values and scales the down
+        linear would compute from its bf16 output, so the bf16 intermediate
+        and the separate quantization pass disappear. Runs once the bf16
+        deferred path is verified, and is checked bitwise against it followed
+        by the per-token quantization on first sight.
+        """
+        if not (
+            _FFN_SCALE_FUSION.verified
+            and can_use_fused_scaled_silu_mul_fp8(*args)
+            and _uses_per_token_quant_warp_kernel(args[0].shape[0], args[0].device)
+            and _takes_per_token_quantized_input(self.out)
+            and _DOWN_INPUT_QUANT_FUSION.can_attempt_once()
+        ):
+            return None
+        quantized = fused_scaled_silu_mul_fp8(*args)
+        if not _DOWN_INPUT_QUANT_FUSION.verified:
+            reference = sglang_per_token_quant_fp8(fused_scaled_silu_mul(*args))
+            quantized = _DOWN_INPUT_QUANT_FUSION.accept_or_fallback(
+                quantized, reference, equal=_quantized_equal, logger=logger
             )
-            hidden = _FFN_SCALE_FUSION.accept_or_fallback(
-                hidden, reference, logger=logger
-            )
-        return hidden.view(*x.shape[:-1], hidden.shape[-1])
+        return self.out.quant_method.apply_per_token_quantized(self.out, *quantized)
 
     def forward(self, x):
         if _SILU_MUL_FUSION.verified and _FFN_SCALE_FUSION.can_attempt_once():
-            hidden = self._deferred_silu_mul(x)
-            if hidden is not None:
-                return self.out(hidden)[0]
+            out = self._deferred_mlp(x)
+            if out is not None:
+                return out
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
         fused = None
         if can_use_fused_silu_mul(gate, value) and _SILU_MUL_FUSION.can_attempt_once():
