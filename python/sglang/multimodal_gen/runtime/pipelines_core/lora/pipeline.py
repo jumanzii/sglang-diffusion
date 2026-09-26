@@ -92,25 +92,50 @@ def stack_or_compose_fused_lora(
     return a_2d, b_2d, a_2d.shape[0]
 
 
+def _fill_unadapted_sections(
+    a_parts: dict[int, torch.Tensor],
+    b_parts: dict[int, torch.Tensor],
+    count: int,
+) -> bool:
+    """Give the sections an adapter does not train zero A/B, so an adapter for
+    only part of an equal-section fused layer (only to_q of to_qkv) leaves the
+    rest unchanged. False when a missing section's size is unknown (unequal
+    sections, e.g. GQA), in which case the group cannot be built."""
+    missing = set(range(count)) - set(a_parts)
+    if not missing:
+        return True
+    if len({b.shape for b in b_parts.values()}) != 1:
+        return False
+    a_like, b_like = next(iter(a_parts.values())), next(iter(b_parts.values()))
+    for index in missing:
+        a_parts[index] = torch.zeros_like(a_like)
+        b_parts[index] = torch.zeros_like(b_like)
+    return True
+
+
 def _store_fused_lora_groups(
     adapter: dict[str, torch.Tensor],
     to_merge_params: dict[Hashable, dict[Any, Any]],
     adapter_alpha: int | None,
     device: torch.device | str,
+    group_sizes: dict[Hashable, int] | None = None,
 ) -> None:
-    """Write deferred fused lora_A/B groups into the adapter dict."""
+    """Write deferred fused lora_A/B groups into the adapter dict.
+
+    group_sizes: sections of each fused lora_A target (from param_names_mapping);
+    without it, a group ends at its highest adapted section.
+    """
+    group_sizes = group_sizes or {}
     for a_key, a_parts in list(to_merge_params.items()):
         if not str(a_key).endswith(".lora_A"):
             continue
         base = str(a_key)[: -len(".lora_A")]
         b_key = f"{base}.lora_B"
         b_parts = to_merge_params.get(b_key)
-        n = max(a_parts) + 1
-        if (
-            b_parts is None
-            or set(a_parts) != set(range(n))
-            or set(b_parts) != set(range(n))
-        ):
+        if b_parts is None or set(a_parts) != set(b_parts):
+            continue
+        n = group_sizes.get(a_key, max(a_parts) + 1)
+        if not _fill_unadapted_sections(a_parts, b_parts, n):
             continue
         a_list = [a_parts[i] for i in range(n)]
         b_list = [b_parts[i] for i in range(n)]
@@ -909,6 +934,7 @@ class LoRAPipeline(ComposedPipelineBase):
         )
 
         to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
+        fused_group_sizes: dict[Hashable, int] = {}
         for name, weight in lora_state_dict.items():
             name = name.replace("diffusion_model.", "")
             name = name.replace(".weight", "")
@@ -920,6 +946,7 @@ class LoRAPipeline(ComposedPipelineBase):
             # see param mapping in HunyuanVideoArchConfig
             if merge_index is not None:
                 to_merge_params[target_name][merge_index] = weight
+                fused_group_sizes[target_name] = num_params_to_merge
                 # A/B of one fused layer must be laid out together (GQA B cannot stack).
                 if target_name.endswith((".lora_A", ".lora_B")):
                     continue
@@ -946,6 +973,7 @@ class LoRAPipeline(ComposedPipelineBase):
             to_merge_params,
             adapter_lora_alpha,
             self.device,
+            fused_group_sizes,
         )
         transformer = self.modules["transformer"]
         if isinstance(transformer, BaseDiT):

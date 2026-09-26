@@ -215,13 +215,20 @@ def test_diffusers_lora_matches_weight_delta_and_restores_base(
     pipeline.modules = {"transformer": actual_model}
     pipeline.__init__()
     weights = {}
-    for name in ("transformer_blocks.0.attn.to_q", "transformer_blocks.0.img_mlp.out"):
-        layer = reference.get_submodule(name)
-        a = torch.randn(2, layer.weight.shape[1], device="cuda") * 0.2
-        b = torch.randn(layer.weight.shape[0], 2, device="cuda") * 0.2
+    # Diffusers adapters name to_q; the model holds it as the first to_qkv shard.
+    targets = {
+        "transformer_blocks.0.attn.to_q": ("transformer_blocks.0.attn.to_qkv", 0),
+        "transformer_blocks.0.img_mlp.out": ("transformer_blocks.0.img_mlp.out", None),
+    }
+    for name, (module, shard) in targets.items():
+        weight = reference.get_submodule(module).weight
+        if shard is not None:
+            weight = weight.chunk(3)[shard]
+        a = torch.randn(2, weight.shape[1], device="cuda") * 0.2
+        b = torch.randn(weight.shape[0], 2, device="cuda") * 0.2
         weights[f"transformer.{name}.lora_A.weight"] = a.cpu()
         weights[f"transformer.{name}.lora_B.weight"] = b.cpu()
-        layer.weight.add_(b @ a)
+        weight.add_(b @ a)
     adapter = tmp_path / "adapter.safetensors"
     save_file(weights, str(adapter))
     kwargs = dict(inputs(5, False), prefix_caches=None)
@@ -371,3 +378,37 @@ def test_silu_fusion_mismatch_restores_eager(bf16_model, monkeypatch):
         torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)
         assert gate.disabled and not gate.verified
         torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("blockscaled", [True, False])
+def test_fp8_mlp_first_call_matches_later_calls(model, monkeypatch, blockscaled):
+    # The first calls verify the SiLU-mul, deferred-scale and FP8-input fusions
+    # on the unfused path; it must round like the fused path, including when
+    # apply_fp8_linear takes the block-scaled GEMM, which rounds once where the
+    # deferred-scale path rounds twice. 4096 tokens reach both SM120 GEMM routes
+    # and the per-token quantization's warp kernel.
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+    from sglang.srt.environ import envs
+    from sglang.srt.utils import is_sm120_supported
+
+    if not is_sm120_supported():
+        pytest.skip("SM120 FP8 GEMM routes")
+    for name in ("_SILU_MUL_FUSION", "_FFN_SCALE_FUSION", "_DOWN_INPUT_QUANT_FUSION"):
+        monkeypatch.setattr(model_module, name, BitExactFusionGate(name))
+    torch.manual_seed(0)
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        mlp = model_module.QwenImage21FeedForward(512, 4, Fp8Config(), "mlp").cuda()
+    finally:
+        torch.set_default_dtype(default_dtype)
+    for linear in (mlp.gate_layer, mlp.proj, mlp.out):
+        torch.nn.init.normal_(linear.weight, std=0.05)
+        linear.quant_method.process_weights_after_loading(linear)
+    x = torch.randn(1, 4096, 512, device="cuda", dtype=torch.bfloat16)
+    with envs.SGLANG_ENABLE_SM120_FP8_BLOCKSCALED_GEMM.override(blockscaled):
+        outputs = [mlp(x) for _ in range(4)]
+    assert model_module._DOWN_INPUT_QUANT_FUSION.verified
+    for output in outputs[1:]:
+        assert torch.equal(output, outputs[0])

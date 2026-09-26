@@ -10,14 +10,22 @@ from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_complex_rope,
     can_use_fused_layernorm_modulate,
+    can_use_fused_scaled_silu_mul,
+    can_use_fused_scaled_silu_mul_fp8,
     can_use_fused_silu_mul,
     can_use_rmsnorm_preserve_reduction,
     fused_complex_rope,
     fused_layernorm_modulate,
+    fused_scaled_silu_mul,
+    fused_scaled_silu_mul_fp8,
     fused_silu_mul_bitexact,
     residual_gate_add,
     rmsnorm_preserve_reduction,
     tensors_equal,
+)
+from sglang.kernels.ops.diffusion.attention.sageattn_prequant_triton import (
+    can_use_sage_prequant_attention,
+    sage_prequant_attention,
 )
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
     can_use_qknorm_complex_rope_kv,
@@ -27,6 +35,7 @@ from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
     can_use_qknorm_complex_rope,
     qknorm_complex_rope,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_world_size,
@@ -40,8 +49,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -57,6 +68,18 @@ _QK_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm + complex RoPE"
 _KV_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 K RMSNorm + RoPE + KV packing")
 _QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
+_SAGE_PREQUANT_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 SageAttention2 operands from the Q/K/V kernels"
+)
+_QKV_SCALE_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 QKV FP8 GEMM scale pass in the SageAttention2 Q/K/V kernels"
+)
+_FFN_SCALE_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 gate/up FP8 GEMM scale pass in the SiLU-mul"
+)
+_DOWN_INPUT_QUANT_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 down-projection FP8 input quantization in the SiLU-mul"
+)
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -216,6 +239,62 @@ class QwenImage21TimeEmbedding(nn.Module):
         )
 
 
+def _deferred_scale_linear(linear, x, quantized_input=None):
+    """The FP8 linear's unscaled product and its scales, or None.
+
+    Only for a plain FP8 linear (no LoRA wrapper, no bias, one rank) on SM120's
+    cuBLASLt route. Returns ``(unscaled [M, N], row_scale [M], col_scale [N],
+    quantized_input)``; the consumer applies ``row_scale[m] * col_scale[n]`` in
+    fp32 as it loads, which replaces the route's separate scale pass.
+    """
+    if (
+        type(linear) not in (ColumnParallelLinear, MergedColumnParallelLinear)
+        or linear.bias is not None
+        or get_tp_world_size() != 1
+        or not isinstance(linear.quant_method, Fp8LinearMethod)
+    ):
+        return None
+    return linear.quant_method.apply_deferred_scale(linear, x, quantized_input)
+
+
+def _takes_per_token_quantized_input(linear):
+    """Whether linear can consume an input its producer quantized per token."""
+    return (
+        type(linear) is RowParallelLinear
+        and linear.bias is None
+        and get_tp_world_size() == 1
+        and isinstance(linear.quant_method, Fp8LinearMethod)
+    )
+
+
+def _uses_per_token_quant_warp_kernel(tokens, device):
+    """Whether sglang_per_token_quant_fp8 takes its warp kernel for this many
+    tokens (per_token_quant_fp8.cuh: at least 2 x SMs x 8). The CTA kernel it
+    uses below that has no zero-scale guard, so an all-zero row there comes out
+    as 448 instead of 0; the fused SiLU-mul reproduces the warp kernel only."""
+    return tokens >= torch.cuda.get_device_properties(device).multi_processor_count * 16
+
+
+def _quantized_equal(a, b):
+    """Bitwise equality of two (FP8 values, fp32 scales) pairs."""
+    return torch.equal(a[0].view(torch.uint8), b[0].view(torch.uint8)) and torch.equal(
+        a[1], b[1]
+    )
+
+
+def _scale_qkv_view(t, row_scale, col_scale):
+    """A [B, S, H, D] view of an unscaled GEMM product, scaled and rounded to
+    bf16 as the GEMM route's scale pass does: ``bf16(x * (sa * sb))``."""
+    batch, seq, heads, dim = t.shape
+    scale = row_scale.view(batch, seq, 1, 1) * col_scale.view(1, 1, heads, dim)
+    return (t.float() * scale).to(t.dtype)
+
+
+def _scale_rows_cols(x, row_scale, col_scale):
+    """``bf16(x * (row_scale[m] * col_scale[n]))`` of an [M, N] unscaled product."""
+    return (x.float() * (row_scale[:, None] * col_scale[None, :])).to(x.dtype)
+
+
 class QwenImage21FeedForward(nn.Module):
     def __init__(self, dim, ratio, quant_config, prefix):
         super().__init__()
@@ -241,8 +320,91 @@ class QwenImage21FeedForward(nn.Module):
             prefix=f"{prefix}.out",
         )
 
+    def _deferred_mlp(self, x):
+        """out(silu(gate) * value) from unscaled gate/value GEMMs, or None.
+
+        Both GEMMs share one quantization of x; the scaled SiLU-mul applies
+        their scales on load with the scale pass's rounding. Runs once the
+        plain SiLU-mul fusion is verified, and is checked bitwise against the
+        scale pass + plain SiLU-mul on first sight.
+        """
+        gate = _deferred_scale_linear(self.gate_layer, x)
+        if gate is None:
+            return None
+        value = _deferred_scale_linear(self.proj, x, quantized_input=gate[3])
+        if value is None:
+            return None
+        args = (gate[0], value[0], gate[1], gate[2], value[2])
+        if not can_use_fused_scaled_silu_mul(*args):
+            return None
+        out = self._silu_mul_fp8_down(args)
+        if out is None:
+            hidden = fused_scaled_silu_mul(*args)
+            if not _FFN_SCALE_FUSION.verified:
+                reference = fused_silu_mul_bitexact(
+                    _scale_rows_cols(gate[0], gate[1], gate[2]),
+                    _scale_rows_cols(value[0], value[1], value[2]),
+                )
+                hidden = _FFN_SCALE_FUSION.accept_or_fallback(
+                    hidden, reference, logger=logger
+                )
+            out = self.out(hidden)[0]
+        return out.view(*x.shape[:-1], out.shape[-1])
+
+    def _silu_mul_fp8_down(self, args):
+        """The down linear fed by a SiLU-mul that writes its FP8 input, or None.
+
+        The SiLU-mul emits the per-token FP8 values and scales the down
+        linear would compute from its bf16 output, so the bf16 intermediate
+        and the separate quantization pass disappear. Runs once the bf16
+        deferred path is verified, and is checked bitwise against it followed
+        by the per-token quantization on first sight.
+        """
+        if not (
+            _FFN_SCALE_FUSION.verified
+            and can_use_fused_scaled_silu_mul_fp8(*args)
+            and _uses_per_token_quant_warp_kernel(args[0].shape[0], args[0].device)
+            and _takes_per_token_quantized_input(self.out)
+            and _DOWN_INPUT_QUANT_FUSION.can_attempt_once()
+        ):
+            return None
+        quantized = fused_scaled_silu_mul_fp8(*args)
+        if not _DOWN_INPUT_QUANT_FUSION.verified:
+            reference = sglang_per_token_quant_fp8(fused_scaled_silu_mul(*args))
+            quantized = _DOWN_INPUT_QUANT_FUSION.accept_or_fallback(
+                quantized, reference, equal=_quantized_equal, logger=logger
+            )
+        return self.out.quant_method.apply_per_token_quantized(self.out, *quantized)
+
+    def _gate_value(self, x):
+        """gate_layer(x) and proj(x), at the deferred MLP's numerics while it can engage.
+
+        The deferred MLP rounds each unscaled GEMM product to bf16 and then
+        applies the scales with the scale pass's rounding; apply_fp8_linear may
+        take a route that rounds once (SM120's block-scaled GEMM). The calls
+        that verify the fusions run this path, so it uses the deferred GEMMs
+        and the scale pass too, and the first call matches every later one bit
+        for bit.
+        """
+        if not (_SILU_MUL_FUSION.disabled or _FFN_SCALE_FUSION.disabled):
+            gate = _deferred_scale_linear(self.gate_layer, x)
+            value = None
+            if gate is not None:
+                value = _deferred_scale_linear(self.proj, x, quantized_input=gate[3])
+            if value is not None:
+                shape = (*x.shape[:-1], -1)
+                return (
+                    _scale_rows_cols(*gate[:3]).view(shape),
+                    _scale_rows_cols(*value[:3]).view(shape),
+                )
+        return self.gate_layer(x)[0], self.proj(x)[0]
+
     def forward(self, x):
-        gate, value = self.gate_layer(x)[0], self.proj(x)[0]
+        if _SILU_MUL_FUSION.verified and _FFN_SCALE_FUSION.can_attempt_once():
+            out = self._deferred_mlp(x)
+            if out is not None:
+                return out
+        gate, value = self._gate_value(x)
         fused = None
         if can_use_fused_silu_mul(gate, value) and _SILU_MUL_FUSION.can_attempt_once():
             fused = fused_silu_mul_bitexact(gate, value)
@@ -260,14 +422,14 @@ class QwenImage21Attention(nn.Module):
         dim = ac.hidden_size
         self.heads = ac.num_attention_heads // get_tp_world_size()
         self.head_dim = ac.attention_head_dim
-        self.to_q = ColumnParallelLinear(
-            dim, dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_q"
-        )
-        self.to_k = ColumnParallelLinear(
-            dim, dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_k"
-        )
-        self.to_v = ColumnParallelLinear(
-            dim, dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_v"
+        # One N = 3 * dim GEMM (and one activation quantization) instead of three.
+        # The checkpoint's to_q/to_k/to_v are merged at load (param_names_mapping).
+        self.to_qkv = MergedColumnParallelLinear(
+            dim,
+            [dim] * 3,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv",
         )
         self.to_out = nn.ModuleList(
             [
@@ -295,20 +457,51 @@ class QwenImage21Attention(nn.Module):
         )
 
     def project_qkv(self, x):
-        q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
-        k = self.to_k(x)[0].unflatten(-1, (self.heads, self.head_dim))
-        v = self.to_v(x)[0].unflatten(-1, (self.heads, self.head_dim))
-        return q, k, v
+        # Views into the merged output: each token's heads stay contiguous, and
+        # tokens are 3 * dim apart, which the fused Q/K kernels accept.
+        qkv = self.to_qkv(x)[0].unflatten(-1, (3, self.heads, self.head_dim))
+        return qkv.unbind(-3)
+
+    def _deferred_qkv(self, x):
+        """Unscaled q, k, v views plus (row_scale, col_scale) for the SA2 prequant path, or None.
+
+        Once that path is verified, its Q/K/V kernels apply the scales on load,
+        which replaces the GEMM route's separate scale pass. Before that,
+        attend_sample applies them with the scale pass's rounding, so the call
+        that verifies the prequant path already has the numerics of every later
+        call (apply_fp8_linear may take a route that rounds once, SM120's
+        block-scaled GEMM).
+        """
+        if not (
+            get_sp_world_size() == 1
+            and self.target_attn.backend == AttentionBackendEnum.SAGE_ATTN
+            and not _SAGE_PREQUANT_FUSION.disabled
+            and _QKV_SCALE_FUSION.can_attempt_once()
+        ):
+            return None
+        deferred = _deferred_scale_linear(self.to_qkv, x)
+        if deferred is None:
+            return None
+        unscaled, row_scale, col_scale, _ = deferred
+        qkv = unscaled.view(*x.shape[:-1], 3, self.heads, self.head_dim)
+        q, k, v = qkv.unbind(-3)
+        return q, k, v, row_scale, col_scale
 
     def qkv(self, x, rope):
         q, k, v = self.project_qkv(x)
         return (
             apply_qk_norm_rope(q, self.norm_q, rope),
             apply_qk_norm_rope(k, self.norm_k, rope),
-            v,
+            # The prefix V becomes the cached V prefix, which the fused K/V
+            # packing kernel reads as a dense buffer.
+            v.contiguous(),
         )
 
-    def attend_sample(self, q, k, v, rope, prefix, prefix_rope, segments, cache):
+    def attend_sample(
+        self, q, k, v, rope, prefix, prefix_rope, segments, cache, scales=None
+    ):
+        """scales: (row_scale [S], qkv_col_scale [3 * H * D]) when q, k, v are
+        views of an unscaled QKV GEMM product (_deferred_qkv), else None."""
         if cache:
             kp, vp = cache["key"], cache["value"]
             prefix_output = None
@@ -332,6 +525,88 @@ class QwenImage21Attention(nn.Module):
             prefix_output = self.to_out[0](torch.cat(outputs, dim=1).flatten(2))[0]
             if cache is not None:
                 cache.update(key=kp, value=vp)
+        can_prequant = (
+            get_sp_world_size() == 1
+            and self.target_attn.backend == AttentionBackendEnum.SAGE_ATTN
+            and can_use_sage_prequant_attention(
+                q, self.norm_q.weight, k, self.norm_k.weight, rope, v, kp, vp
+            )
+        )
+        if scales is not None:
+            if can_prequant and _SAGE_PREQUANT_FUSION.verified:
+                row_scale, qkv_col_scale = scales
+                out = sage_prequant_attention(
+                    q,
+                    self.norm_q.weight,
+                    self.norm_q.variance_epsilon,
+                    k,
+                    self.norm_k.weight,
+                    self.norm_k.variance_epsilon,
+                    rope,
+                    v,
+                    kp,
+                    vp,
+                    self.target_attn.softmax_scale,
+                    row_scale=row_scale,
+                    qkv_col_scale=qkv_col_scale,
+                )
+                if not _QKV_SCALE_FUSION.verified:
+                    width = self.heads * self.head_dim
+                    qs, ks, vs = (
+                        _scale_qkv_view(
+                            t, row_scale, qkv_col_scale[i * width : (i + 1) * width]
+                        )
+                        for i, t in enumerate((q, k, v))
+                    )
+                    reference = sage_prequant_attention(
+                        qs,
+                        self.norm_q.weight,
+                        self.norm_q.variance_epsilon,
+                        ks,
+                        self.norm_k.weight,
+                        self.norm_k.variance_epsilon,
+                        rope,
+                        vs,
+                        kp,
+                        vp,
+                        self.target_attn.softmax_scale,
+                    )
+                    out = _QKV_SCALE_FUSION.accept_or_fallback(
+                        out, reference, logger=logger
+                    )
+                return out, prefix_output
+            width = self.heads * self.head_dim
+            row_scale, qkv_col_scale = scales
+            q, k, v = (
+                _scale_qkv_view(
+                    t, row_scale, qkv_col_scale[i * width : (i + 1) * width]
+                )
+                for i, t in enumerate((q, k, v))
+            )
+        if can_prequant and _SAGE_PREQUANT_FUSION.can_attempt_once():
+            fused = sage_prequant_attention(
+                q,
+                self.norm_q.weight,
+                self.norm_q.variance_epsilon,
+                k,
+                self.norm_k.weight,
+                self.norm_k.variance_epsilon,
+                rope,
+                v,
+                kp,
+                vp,
+                self.target_attn.softmax_scale,
+            )
+            if _SAGE_PREQUANT_FUSION.verified:
+                return fused, prefix_output
+            reference = self.attend_target(q, k, v, rope, kp, vp)
+            out = _SAGE_PREQUANT_FUSION.accept_or_fallback(
+                fused, reference, logger=logger
+            )
+            return out, prefix_output
+        return self.attend_target(q, k, v, rope, kp, vp), prefix_output
+
+    def attend_target(self, q, k, v, rope, kp, vp):
         q = apply_qk_norm_rope(q, self.norm_q, rope)
         packed = None
         if (
@@ -354,17 +629,24 @@ class QwenImage21Attention(nn.Module):
                     logger=logger,
                 )
         if packed is not None:
-            out = self.target_attn(q, *packed)
-        else:
-            k = apply_qk_norm_rope(k, self.norm_k, rope)
-            out = self.target_attn.forward_with_replicated_kv_prefix(q, kp, vp, k, v)
-        return out, prefix_output
+            return self.target_attn(q, *packed)
+        k = apply_qk_norm_rope(k, self.norm_k, rope)
+        return self.target_attn.forward_with_replicated_kv_prefix(q, kp, vp, k, v)
 
     def forward(self, x, ropes, prefixes, layouts, caches):
         # batch target projections while retaining each sample's unpadded prefix
-        q, k, v = self.project_qkv(x)
+        deferred = self._deferred_qkv(x)
+        if deferred is None:
+            q, k, v = self.project_qkv(x)
+            row_scale = col_scale = None
+        else:
+            q, k, v, row_scale, col_scale = deferred
+        seq = x.shape[1]
         outputs, prefix_outputs = [], []
         for sample, layout in enumerate(layouts):
+            scales = None
+            if row_scale is not None:
+                scales = (row_scale[sample * seq : (sample + 1) * seq], col_scale)
             out, prefix_out = self.attend_sample(
                 q[sample : sample + 1],
                 k[sample : sample + 1],
@@ -374,6 +656,7 @@ class QwenImage21Attention(nn.Module):
                 layout["prefix_rope"],
                 layout["segments"],
                 caches[sample],
+                scales,
             )
             outputs.append(out)
             prefix_outputs.append(prefix_out)
@@ -466,7 +749,17 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
     ]
     _compile_conditions = _fsdp_shard_conditions
     layer_names = ["transformer_blocks"]
-    param_names_mapping = {}
+    # Checkpoint weights and Diffusers LoRA A/B tensors of to_q/to_k/to_v both
+    # map to shards of the merged to_qkv.
+    param_names_mapping = {
+        rf"^(transformer_blocks\.\d+\.attn)\.to_{name}\.(.+)$": (
+            r"\1.to_qkv.\2",
+            index,
+            3,
+        )
+        for index, name in enumerate("qkv")
+    }
+    packed_modules_mapping = {"to_qkv": ["to_q", "to_k", "to_v"]}
 
     def __init__(self, config, hf_config, quant_config=None, **kwargs):
         super().__init__(config, hf_config=hf_config, **kwargs)

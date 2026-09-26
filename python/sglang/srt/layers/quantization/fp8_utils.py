@@ -228,7 +228,15 @@ if _use_aiter:
 
 if _is_cuda:
     from sglang.kernels.ops.gemm import fp8_scaled_mm
+    from sglang.kernels.ops.gemm.fp8_blockscaled_gemm import (
+        maybe_fp8_blockscaled_scaled_mm_sm120,
+    )
     from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
+    from sglang.kernels.ops.gemm.fp8_cublaslt_gemm import (
+        MIN_CUBLASLT_M,
+        fp8_unit_scale_gemm_cublaslt,
+        maybe_fp8_per_channel_scaled_mm_cublaslt,
+    )
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
@@ -2041,6 +2049,85 @@ def apply_fp8_linear_bmm_flashinfer(
     return output.view(*output_shape)
 
 
+def apply_fp8_linear_deferred_scale(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    quantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> Optional[
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+]:
+    """apply_fp8_linear's SM120 cuBLASLt route without its scale pass, or None.
+
+    Returns ``(unscaled, row_scale, col_scale, (qinput, x_scale))`` where
+    ``unscaled * row_scale[:, None] * col_scale[None, :]`` (fp32) is the linear
+    output, for a consumer kernel that applies the scales as it loads. The
+    input is quantized per token, as apply_fp8_linear does with no input_scale;
+    pass ``quantized_input`` to reuse another linear's quantization of the same
+    input. None whenever apply_fp8_linear would not take the cuBLASLt route.
+    """
+    if not (
+        _is_cuda
+        and get_platform().is_sm120
+        and envs.SGLANG_ENABLE_SM120_FP8_CUBLASLT_GEMM.get()
+        and input.dtype == torch.bfloat16
+        and weight.dtype == torch.float8_e4m3fn
+        and weight_scale.numel() == weight.shape[1]
+        and weight.shape[0] % 16 == 0
+        and weight.shape[1] % 16 == 0
+    ):
+        return None
+    input_2d = input.reshape(-1, input.shape[-1])
+    w_nk = weight.t()
+    if input_2d.shape[0] < MIN_CUBLASLT_M or not w_nk.is_contiguous():
+        return None
+    if quantized_input is None:
+        quantized_input = sglang_per_token_quant_fp8(input_2d.contiguous())
+    qinput, x_scale = quantized_input
+    unscaled = fp8_unit_scale_gemm_cublaslt(qinput, w_nk)
+    return (
+        unscaled,
+        x_scale.reshape(-1),
+        weight_scale.reshape(-1).contiguous(),
+        quantized_input,
+    )
+
+
+def apply_fp8_linear_per_token_quantized(
+    qinput: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """apply_fp8_linear's SM120 block-scaled or cuBLASLt route for an input its
+    producer has already quantized per token (as sglang_per_token_quant_fp8
+    would), or None.
+
+    ``qinput`` is [M, K] e4m3 and ``x_scale`` [M, 1] fp32. The routes are tried
+    in apply_fp8_linear's order, so the result is the one apply_fp8_linear
+    returns for the unquantized input. None whenever apply_fp8_linear would take
+    neither route; the caller then runs the plain linear on the unquantized input.
+    """
+    if not (
+        _is_cuda
+        and get_platform().is_sm120
+        and qinput.dtype == torch.float8_e4m3fn
+        and weight.dtype == torch.float8_e4m3fn
+        and weight_scale.numel() == weight.shape[1]
+    ):
+        return None
+    output = None
+    if envs.SGLANG_ENABLE_SM120_FP8_BLOCKSCALED_GEMM.get():
+        output = maybe_fp8_blockscaled_scaled_mm_sm120(
+            qinput, weight, x_scale, weight_scale, out_dtype=torch.bfloat16
+        )
+    if output is None and envs.SGLANG_ENABLE_SM120_FP8_CUBLASLT_GEMM.get():
+        output = maybe_fp8_per_channel_scaled_mm_cublaslt(
+            qinput, weight, x_scale, weight_scale, out_dtype=torch.bfloat16
+        )
+    return output
+
+
 def apply_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -2094,6 +2181,16 @@ def apply_fp8_linear(
     # SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 is the kill switch.
     use_tuned_triton_channelwise = (
         use_cutlass_channelwise_gemm and envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
+    )
+    use_sm120_cublaslt = (
+        use_cutlass_channelwise_gemm
+        and get_platform().is_sm120
+        and envs.SGLANG_ENABLE_SM120_FP8_CUBLASLT_GEMM.get()
+    )
+    use_sm120_blockscaled = (
+        use_cutlass_channelwise_gemm
+        and get_platform().is_sm120
+        and envs.SGLANG_ENABLE_SM120_FP8_BLOCKSCALED_GEMM.get()
     )
     native_scalar_a_scale = use_cutlass_channelwise_gemm and (
         get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
@@ -2208,14 +2305,25 @@ def apply_fp8_linear(
                 num_stages=tuned_config["num_stages"],
             )
         else:
-            output = fp8_scaled_mm(
-                qinput,
-                weight,
-                x_scale,
-                weight_scale,
-                out_dtype=output_dtype,
-                bias=bias,
-            )
+            output = None
+            per_token_no_bias = bias is None and x_scale.numel() == qinput.shape[0]
+            if use_sm120_blockscaled and per_token_no_bias:
+                output = maybe_fp8_blockscaled_scaled_mm_sm120(
+                    qinput, weight, x_scale, weight_scale, out_dtype=output_dtype
+                )
+            if output is None and use_sm120_cublaslt and per_token_no_bias:
+                output = maybe_fp8_per_channel_scaled_mm_cublaslt(
+                    qinput, weight, x_scale, weight_scale, out_dtype=output_dtype
+                )
+            if output is None:
+                output = fp8_scaled_mm(
+                    qinput,
+                    weight,
+                    x_scale,
+                    weight_scale,
+                    out_dtype=output_dtype,
+                    bias=bias,
+                )
         return output.view(*output_shape)
 
     # torch.scaled_mm supports per tensor weights + activations only
