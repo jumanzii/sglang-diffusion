@@ -1021,6 +1021,13 @@ class Envs:
     # instead of sgl-kernel's CUTLASS kernel. cuBLASLt has no per-row/per-column
     # FP8 scales on SM120, so the product is rounded to bf16 one extra time.
     SGLANG_ENABLE_SM120_FP8_CUBLASLT_GEMM = EnvBool(True)
+    # On by default; set SGLANG_ENABLE_SM120_FP8_BLOCKSCALED_GEMM=0 as a kill switch.
+    # On SM120, per-token x per-channel FP8 GEMMs with >= 1024 tokens run a JIT
+    # CUTLASS kernel on the block-scaled (MXFP8) MMA with unit scale factors, ahead
+    # of the cuBLASLt route. Its epilogue applies the scales in fp32 before the one
+    # bf16 rounding (the cuBLASLt route rounds twice). The kernel has no split-K or
+    # StreamK reduction, so its output is bitwise reproducible run to run.
+    SGLANG_ENABLE_SM120_FP8_BLOCKSCALED_GEMM = EnvBool(True)
 
     # ===================================================================
     # Humming quantization

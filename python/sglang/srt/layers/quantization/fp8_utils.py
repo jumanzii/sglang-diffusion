@@ -228,6 +228,9 @@ if _use_aiter:
 
 if _is_cuda:
     from sglang.kernels.ops.gemm import fp8_scaled_mm
+    from sglang.kernels.ops.gemm.fp8_blockscaled_gemm import (
+        maybe_fp8_blockscaled_scaled_mm_sm120,
+    )
     from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
     from sglang.kernels.ops.gemm.fp8_cublaslt_gemm import (
         MIN_CUBLASLT_M,
@@ -2176,6 +2179,11 @@ def apply_fp8_linear(
         and get_platform().is_sm120
         and envs.SGLANG_ENABLE_SM120_FP8_CUBLASLT_GEMM.get()
     )
+    use_sm120_blockscaled = (
+        use_cutlass_channelwise_gemm
+        and get_platform().is_sm120
+        and envs.SGLANG_ENABLE_SM120_FP8_BLOCKSCALED_GEMM.get()
+    )
     native_scalar_a_scale = use_cutlass_channelwise_gemm and (
         get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
     )
@@ -2291,7 +2299,11 @@ def apply_fp8_linear(
         else:
             output = None
             per_token_no_bias = bias is None and x_scale.numel() == qinput.shape[0]
-            if use_sm120_cublaslt and per_token_no_bias:
+            if use_sm120_blockscaled and per_token_no_bias:
+                output = maybe_fp8_blockscaled_scaled_mm_sm120(
+                    qinput, weight, x_scale, weight_scale, out_dtype=output_dtype
+                )
+            if output is None and use_sm120_cublaslt and per_token_no_bias:
                 output = maybe_fp8_per_channel_scaled_mm_cublaslt(
                     qinput, weight, x_scale, weight_scale, out_dtype=output_dtype
                 )
