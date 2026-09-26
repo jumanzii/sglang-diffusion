@@ -90,6 +90,49 @@ def test_fused_sections_preserve_per_layer_alpha():
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
+def test_partial_group_leaves_unadapted_sections_unchanged():
+    # A Diffusers adapter for only to_q of a merged to_qkv (equal sections).
+    torch.manual_seed(1)
+    lora_a, lora_b = torch.randn(2, IN_DIM), torch.randn(4, 2)
+    pending = defaultdict(dict)
+    pending["attn.to_qkv.lora_A"][0] = lora_a
+    pending["attn.to_qkv.lora_B"][0] = lora_b
+
+    adapter = {}
+    _store_fused_lora_groups(
+        adapter,
+        pending,
+        adapter_alpha=None,
+        device="cpu",
+        group_sizes={"attn.to_qkv.lora_A": 3},
+    )
+
+    a, b = adapter["attn.to_qkv.lora_A"], adapter["attn.to_qkv.lora_B"]
+    assert a.shape == (3, 2, IN_DIM) and b.shape == (3, 4, 2)
+    x = torch.randn(5, IN_DIM)
+    delta = torch.cat([x @ a[i].T @ b[i].T for i in range(3)], dim=-1)
+    expected = torch.cat([x @ lora_a.T @ lora_b.T, torch.zeros(5, 8)], dim=-1)
+    torch.testing.assert_close(delta, expected, rtol=0, atol=0)
+
+
+def test_partial_group_with_unequal_sections_is_dropped():
+    # The missing section's size is unknown, so the group cannot be built.
+    a_list, b_list = _make_ab_lists([2, 3, 1])
+    pending = defaultdict(dict)
+    for index in (0, 1):
+        pending["attn.qkv.lora_A"][index] = a_list[index]
+        pending["attn.qkv.lora_B"][index] = b_list[index]
+    adapter = {}
+    _store_fused_lora_groups(
+        adapter,
+        pending,
+        adapter_alpha=None,
+        device="cpu",
+        group_sizes={"attn.qkv.lora_A": 3},
+    )
+    assert adapter == {}
+
+
 def test_stack_kept_for_equal_sections():
     torch.manual_seed(0)
     a_list = [torch.randn(2, IN_DIM) for _ in range(2)]
