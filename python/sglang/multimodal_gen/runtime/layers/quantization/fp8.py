@@ -411,8 +411,9 @@ class Fp8LinearMethod(LinearMethodBase):
         """apply() for an input already quantized per token by its producer, or None.
 
         See apply_fp8_linear_per_token_quantized: the same output apply()
-        returns for the unquantized input on SM120's cuBLASLt per-channel
-        route (dynamic per-token activations, no marlin / block quantization).
+        returns for the unquantized input on SM120's block-scaled or cuBLASLt
+        per-channel route (dynamic per-token activations, no marlin / block
+        quantization).
         """
         if self.use_marlin or self.block_quant or layer.input_scale is not None:
             return None

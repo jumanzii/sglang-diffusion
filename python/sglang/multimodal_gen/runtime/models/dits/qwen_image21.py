@@ -376,12 +376,35 @@ class QwenImage21FeedForward(nn.Module):
             )
         return self.out.quant_method.apply_per_token_quantized(self.out, *quantized)
 
+    def _gate_value(self, x):
+        """gate_layer(x) and proj(x), at the deferred MLP's numerics while it can engage.
+
+        The deferred MLP rounds each unscaled GEMM product to bf16 and then
+        applies the scales with the scale pass's rounding; apply_fp8_linear may
+        take a route that rounds once (SM120's block-scaled GEMM). The calls
+        that verify the fusions run this path, so it uses the deferred GEMMs
+        and the scale pass too, and the first call matches every later one bit
+        for bit.
+        """
+        if not (_SILU_MUL_FUSION.disabled or _FFN_SCALE_FUSION.disabled):
+            gate = _deferred_scale_linear(self.gate_layer, x)
+            value = None
+            if gate is not None:
+                value = _deferred_scale_linear(self.proj, x, quantized_input=gate[3])
+            if value is not None:
+                shape = (*x.shape[:-1], -1)
+                return (
+                    _scale_rows_cols(*gate[:3]).view(shape),
+                    _scale_rows_cols(*value[:3]).view(shape),
+                )
+        return self.gate_layer(x)[0], self.proj(x)[0]
+
     def forward(self, x):
         if _SILU_MUL_FUSION.verified and _FFN_SCALE_FUSION.can_attempt_once():
             out = self._deferred_mlp(x)
             if out is not None:
                 return out
-        gate, value = self.gate_layer(x)[0], self.proj(x)[0]
+        gate, value = self._gate_value(x)
         fused = None
         if can_use_fused_silu_mul(gate, value) and _SILU_MUL_FUSION.can_attempt_once():
             fused = fused_silu_mul_bitexact(gate, value)
@@ -442,13 +465,17 @@ class QwenImage21Attention(nn.Module):
     def _deferred_qkv(self, x):
         """Unscaled q, k, v views plus (row_scale, col_scale) for the SA2 prequant path, or None.
 
-        Only once that path is verified: its Q/K/V kernels apply the scales on
-        load, which replaces the GEMM route's separate scale pass.
+        Once that path is verified, its Q/K/V kernels apply the scales on load,
+        which replaces the GEMM route's separate scale pass. Before that,
+        attend_sample applies them with the scale pass's rounding, so the call
+        that verifies the prequant path already has the numerics of every later
+        call (apply_fp8_linear may take a route that rounds once, SM120's
+        block-scaled GEMM).
         """
         if not (
             get_sp_world_size() == 1
             and self.target_attn.backend == AttentionBackendEnum.SAGE_ATTN
-            and _SAGE_PREQUANT_FUSION.verified
+            and not _SAGE_PREQUANT_FUSION.disabled
             and _QKV_SCALE_FUSION.can_attempt_once()
         ):
             return None

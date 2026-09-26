@@ -195,5 +195,27 @@ def test_apply_fp8_linear_takes_this_route_only_when_enabled(enabled):
     assert torch.equal(out, expected)
 
 
+@pytest.mark.parametrize("blockscaled", [True, False])
+def test_per_token_quantized_route_matches_apply_fp8_linear(blockscaled):
+    from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
+    from sglang.srt.layers.quantization.fp8_utils import (
+        apply_fp8_linear,
+        apply_fp8_linear_per_token_quantized,
+    )
+
+    torch.manual_seed(0)
+    m, n, k = 1024, 4096, 12288
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    _, w, _, weight_scale = _operands(m, n, k)
+    weight_scale = weight_scale.reshape(n, 1)
+    qx, x_scale = sglang_per_token_quant_fp8(x)
+    with envs.SGLANG_ENABLE_SM120_FP8_BLOCKSCALED_GEMM.override(blockscaled):
+        expected = apply_fp8_linear(
+            x, w.t(), weight_scale, use_per_token_if_dynamic=True
+        )
+        out = apply_fp8_linear_per_token_quantized(qx, x_scale, w.t(), weight_scale)
+    assert torch.equal(out, expected)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
