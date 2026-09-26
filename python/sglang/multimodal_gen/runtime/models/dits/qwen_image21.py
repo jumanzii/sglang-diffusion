@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -260,14 +261,14 @@ class QwenImage21Attention(nn.Module):
         dim = ac.hidden_size
         self.heads = ac.num_attention_heads // get_tp_world_size()
         self.head_dim = ac.attention_head_dim
-        self.to_q = ColumnParallelLinear(
-            dim, dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_q"
-        )
-        self.to_k = ColumnParallelLinear(
-            dim, dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_k"
-        )
-        self.to_v = ColumnParallelLinear(
-            dim, dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_v"
+        # One N = 3 * dim GEMM (and one activation quantization) instead of three.
+        # The checkpoint's to_q/to_k/to_v are merged at load (param_names_mapping).
+        self.to_qkv = MergedColumnParallelLinear(
+            dim,
+            [dim] * 3,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv",
         )
         self.to_out = nn.ModuleList(
             [
@@ -295,17 +296,19 @@ class QwenImage21Attention(nn.Module):
         )
 
     def project_qkv(self, x):
-        q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
-        k = self.to_k(x)[0].unflatten(-1, (self.heads, self.head_dim))
-        v = self.to_v(x)[0].unflatten(-1, (self.heads, self.head_dim))
-        return q, k, v
+        # Views into the merged output: each token's heads stay contiguous, and
+        # tokens are 3 * dim apart, which the fused Q/K kernels accept.
+        qkv = self.to_qkv(x)[0].unflatten(-1, (3, self.heads, self.head_dim))
+        return qkv.unbind(-3)
 
     def qkv(self, x, rope):
         q, k, v = self.project_qkv(x)
         return (
             apply_qk_norm_rope(q, self.norm_q, rope),
             apply_qk_norm_rope(k, self.norm_k, rope),
-            v,
+            # The prefix V becomes the cached V prefix, which the fused K/V
+            # packing kernel reads as a dense buffer.
+            v.contiguous(),
         )
 
     def attend_sample(self, q, k, v, rope, prefix, prefix_rope, segments, cache):
@@ -466,7 +469,17 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
     ]
     _compile_conditions = _fsdp_shard_conditions
     layer_names = ["transformer_blocks"]
-    param_names_mapping = {}
+    # Checkpoint weights and Diffusers LoRA A/B tensors of to_q/to_k/to_v both
+    # map to shards of the merged to_qkv.
+    param_names_mapping = {
+        rf"^(transformer_blocks\.\d+\.attn)\.to_{name}\.(.+)$": (
+            r"\1.to_qkv.\2",
+            index,
+            3,
+        )
+        for index, name in enumerate("qkv")
+    }
+    packed_modules_mapping = {"to_qkv": ["to_q", "to_k", "to_v"]}
 
     def __init__(self, config, hf_config, quant_config=None, **kwargs):
         super().__init__(config, hf_config=hf_config, **kwargs)

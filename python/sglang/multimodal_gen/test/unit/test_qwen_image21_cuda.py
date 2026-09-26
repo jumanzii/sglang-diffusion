@@ -215,13 +215,20 @@ def test_diffusers_lora_matches_weight_delta_and_restores_base(
     pipeline.modules = {"transformer": actual_model}
     pipeline.__init__()
     weights = {}
-    for name in ("transformer_blocks.0.attn.to_q", "transformer_blocks.0.img_mlp.out"):
-        layer = reference.get_submodule(name)
-        a = torch.randn(2, layer.weight.shape[1], device="cuda") * 0.2
-        b = torch.randn(layer.weight.shape[0], 2, device="cuda") * 0.2
+    # Diffusers adapters name to_q; the model holds it as the first to_qkv shard.
+    targets = {
+        "transformer_blocks.0.attn.to_q": ("transformer_blocks.0.attn.to_qkv", 0),
+        "transformer_blocks.0.img_mlp.out": ("transformer_blocks.0.img_mlp.out", None),
+    }
+    for name, (module, shard) in targets.items():
+        weight = reference.get_submodule(module).weight
+        if shard is not None:
+            weight = weight.chunk(3)[shard]
+        a = torch.randn(2, weight.shape[1], device="cuda") * 0.2
+        b = torch.randn(weight.shape[0], 2, device="cuda") * 0.2
         weights[f"transformer.{name}.lora_A.weight"] = a.cpu()
         weights[f"transformer.{name}.lora_B.weight"] = b.cpu()
-        layer.weight.add_(b @ a)
+        weight.add_(b @ a)
     adapter = tmp_path / "adapter.safetensors"
     save_file(weights, str(adapter))
     kwargs = dict(inputs(5, False), prefix_caches=None)

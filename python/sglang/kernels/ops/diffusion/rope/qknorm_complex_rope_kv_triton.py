@@ -9,6 +9,7 @@ from sglang.kernels.ops.diffusion.rope.complex_rope_triton import _fuse_real_sin
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
     _qknorm_complex_rope_rows,
     can_use_qknorm_complex_rope,
+    token_stride,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -26,6 +27,8 @@ def _qknorm_complex_rope_kv_kernel(
     ROWS: tl.constexpr,
     SEQ: tl.constexpr,
     HEADS: tl.constexpr,
+    K_TOKEN_STRIDE: tl.constexpr,
+    V_TOKEN_STRIDE: tl.constexpr,
     PREFIX: tl.constexpr,
     BATCH: tl.constexpr,
     EPS: tl.constexpr,
@@ -36,13 +39,23 @@ def _qknorm_complex_rope_kv_kernel(
         row = pid * 4 + tl.arange(0, 4)
         column = tl.arange(0, 128)
         key = _qknorm_complex_rope_rows(
-            k_ptr, weight_ptr, rope_ptr, row, ROWS, SEQ, HEADS, EPS, FUSE_REAL_SIN
+            k_ptr,
+            weight_ptr,
+            rope_ptr,
+            row,
+            ROWS,
+            SEQ,
+            HEADS,
+            K_TOKEN_STRIDE,
+            EPS,
+            FUSE_REAL_SIN,
         )
         out_row = row + (row // (SEQ * HEADS) + 1) * PREFIX * HEADS
         output_index = out_row[:, None] * 128 + column[None, :]
         mask = row[:, None] < ROWS
         tl.store(kout_ptr + output_index, key, mask)
-        value = tl.load(v_ptr + row[:, None] * 128 + column[None, :], mask, 0)
+        v_offset = row // HEADS * V_TOKEN_STRIDE + row % HEADS * 128
+        value = tl.load(v_ptr + v_offset[:, None] + column[None, :], mask, 0)
         tl.store(vout_ptr + output_index, value, mask)
     else:
         index = (pid - tl.cdiv(ROWS, 4)) * 1024 + tl.arange(0, 1024)
@@ -58,6 +71,9 @@ def can_use_qknorm_complex_rope_kv(k, weight, rope, v, k_prefix, v_prefix):
     return (
         can_use_qknorm_complex_rope(k, weight, rope)
         and v.shape == k.shape
+        and v.device == k.device
+        and v.dtype == k.dtype
+        and token_stride(v) is not None
         and k_prefix.ndim == 4
         and k_prefix.shape[0] == k.shape[0]
         and k_prefix.shape[1] > 0
@@ -65,7 +81,7 @@ def can_use_qknorm_complex_rope_kv(k, weight, rope, v, k_prefix, v_prefix):
         and v_prefix.shape == k_prefix.shape
         and all(
             x.device == k.device and x.dtype == k.dtype and x.is_contiguous()
-            for x in (v, k_prefix, v_prefix)
+            for x in (k_prefix, v_prefix)
         )
     )
 
@@ -113,6 +129,8 @@ def qknorm_complex_rope_kv(
             batch * seq * heads,
             seq,
             heads,
+            token_stride(k),
+            token_stride(v),
             prefix,
             batch,
             eps,
