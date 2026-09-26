@@ -1015,6 +1015,12 @@ class Envs:
     # kernels/ops/quantization/configs/ (currently L40S), so it is a no-op on
     # any other GPU / untuned shape even when enabled.
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
+    # On by default; set SGLANG_ENABLE_SM120_FP8_CUBLASLT_GEMM=0 as a kill switch.
+    # On SM120, per-token x per-channel FP8 GEMMs with >= 1024 tokens run as a
+    # cuBLASLt FP8 GEMM with unit scales (bf16 out) plus an in-place scale pass
+    # instead of sgl-kernel's CUTLASS kernel. cuBLASLt has no per-row/per-column
+    # FP8 scales on SM120, so the product is rounded to bf16 one extra time.
+    SGLANG_ENABLE_SM120_FP8_CUBLASLT_GEMM = EnvBool(True)
 
     # ===================================================================
     # Humming quantization

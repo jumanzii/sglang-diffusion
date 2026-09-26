@@ -229,6 +229,9 @@ if _use_aiter:
 if _is_cuda:
     from sglang.kernels.ops.gemm import fp8_scaled_mm
     from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
+    from sglang.kernels.ops.gemm.fp8_cublaslt_gemm import (
+        maybe_fp8_per_channel_scaled_mm_cublaslt,
+    )
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
@@ -2095,6 +2098,11 @@ def apply_fp8_linear(
     use_tuned_triton_channelwise = (
         use_cutlass_channelwise_gemm and envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
     )
+    use_sm120_cublaslt = (
+        use_cutlass_channelwise_gemm
+        and get_platform().is_sm120
+        and envs.SGLANG_ENABLE_SM120_FP8_CUBLASLT_GEMM.get()
+    )
     native_scalar_a_scale = use_cutlass_channelwise_gemm and (
         get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
     )
@@ -2208,14 +2216,21 @@ def apply_fp8_linear(
                 num_stages=tuned_config["num_stages"],
             )
         else:
-            output = fp8_scaled_mm(
-                qinput,
-                weight,
-                x_scale,
-                weight_scale,
-                out_dtype=output_dtype,
-                bias=bias,
-            )
+            output = None
+            per_token_no_bias = bias is None and x_scale.numel() == qinput.shape[0]
+            if use_sm120_cublaslt and per_token_no_bias:
+                output = maybe_fp8_per_channel_scaled_mm_cublaslt(
+                    qinput, weight, x_scale, weight_scale, out_dtype=output_dtype
+                )
+            if output is None:
+                output = fp8_scaled_mm(
+                    qinput,
+                    weight,
+                    x_scale,
+                    weight_scale,
+                    out_dtype=output_dtype,
+                    bias=bias,
+                )
         return output.view(*output_shape)
 
     # torch.scaled_mm supports per tensor weights + activations only
