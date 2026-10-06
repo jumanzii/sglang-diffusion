@@ -839,9 +839,8 @@ class HiCacheController:
         self.write_queue.clear()
 
         if self.load_fence_stream is not None:
-            # In overlap scheduling a finished request is cached while the next
-            # forward still writes its last token's KV. wait_stream orders the
-            # copy after the forwards queued so far, not after later ones.
+            # Overlap scheduling caches a finished request while the next forward
+            # still writes its last token's KV; later forwards still overlap.
             self.l2_transfer_engine.device_to_host_stream.wait_stream(
                 self.load_fence_stream
             )

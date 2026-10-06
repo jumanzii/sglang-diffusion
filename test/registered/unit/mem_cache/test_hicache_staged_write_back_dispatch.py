@@ -1288,9 +1288,10 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
             controller.write(_indices(4, 8), node_id=1)
 
-        # The wait, then the one copy the write submits.
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0], "d2h waits forward")
+        # Then the write's one copy, of the node's device slots.
+        self.assertEqual(events[1][1].tolist(), [4, 5, 6, 7])
 
     def test_hybrid_write_flushes_by_default(self):
         captured = []
