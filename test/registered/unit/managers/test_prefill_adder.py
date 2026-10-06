@@ -1706,16 +1706,8 @@ class _WindowLockTree:
 
 
 class TestHiCacheLoadBackSWAWindow(CustomTestCase):
-    """A HiCache load-back must not be admitted on SWA that its window lock takes.
-
-    Selection pins only the device match (`last_node`). The load-back then locks
-    the sliding window from `best_match_node`, which can cover device SWA past
-    `last_node` that selection counted as evictable. The numbers are from a
-    Gemma-4 (window 1024) scheduler crash: a 2071-token chunk plus a 247-token
-    request with 1019 host SWA tokens to load passed admission, the load locked
-    350 device SWA tokens above the host segment, and `alloc_for_extend` was
-    left 2270 free + evictable SWA tokens for 2318.
-    """
+    """A HiCache load-back must not be admitted on device SWA that its window lock
+    (from best_match_node, past the device match) takes; replays a real crash."""
 
     WINDOW = 1024
     DEVICE_PREFIX = 13
@@ -1757,7 +1749,6 @@ class TestHiCacheLoadBackSWAWindow(CustomTestCase):
         allocator = MagicMock()
         allocator.page_size = 1
         allocator.size_swa = 42985
-        allocator.swa_req_ring = False
         allocator.full_available_size.return_value = 100_000
         allocator.available_size.return_value = 100_000
         allocator.swa_available_size.side_effect = lambda: tree.swa_available

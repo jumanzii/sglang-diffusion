@@ -15,8 +15,8 @@
 The scheduler supplies token demand and its chunk/decode limits. These objects
 account for admitted but not yet allocated work and query live cache capacity:
 locking a prefix or preempting a request must affect the next admission check.
-Selection checks do not mutate cache state. Shared-pool load preparation
-realizes the selected reservation before a host transfer pins device rows.
+Selection checks do not mutate cache state. Load preparation runs once the
+host match is pinned: separate pools re-check it, shared pools realize it.
 """
 
 from typing import Optional
@@ -82,7 +82,7 @@ class PrefillBudget:
         swa_host_hit_length: int,
         chunk_limit: int | None,
     ) -> bool:
-        """Prepare pools whose admission depends on movable shared space."""
+        """Re-check or realize admission with the load-back's host match pinned."""
         return True
 
     def _available_and_evictable(self):
@@ -230,9 +230,8 @@ class SWAPrefillBudget(PrefillBudget):
         swa_host_hit_length: int,
         chunk_limit: int | None,
     ) -> bool:
-        # Selection ran with only the device match pinned. The caller holds the
-        # load-back pin on best_match_node here, whose window can cover device
-        # SWA past that match that selection counted as evictable.
+        # Selection pinned only the device match; best_match_node's window, now
+        # pinned too, can hold device SWA past it that selection counted as free.
         return self._swa_fits(
             self.swa_tokens(
                 self.ceil_paged_tokens(extend_input_len),
