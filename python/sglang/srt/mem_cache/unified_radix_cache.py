@@ -3546,8 +3546,11 @@ class UnifiedRadixCache(BasePrefixCache):
         checkpoint = req.kv.mamba_last_track_seqlen if self.is_mamba_enabled else None
         if checkpoint is not None:
             floors.append(checkpoint - self._sliding_window_size)
+        # A mamba hybrid inserts at its checkpoints, so a match lands there and
+        # cannot use a margin behind the prompt end.
         if (
             self._swa_cached_window_size > self._sliding_window_size
+            and not self.is_mamba_enabled
             and not req.skip_radix_cache_insert
         ):
             prompt_floor = len(req.origin_input_ids) - self._swa_cached_window_size

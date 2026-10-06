@@ -10615,15 +10615,9 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
 
 
 class TestSWACacheWindowMargin(CustomTestCase):
-    """A cached prompt must stay reusable by a match that ends a few tokens
-    before its end, up to SGLANG_SWA_CACHE_WINDOW_MARGIN tokens.
-
-    A chat template that renders the previous assistant turn differently from
-    the generation prompt it was decoded under (Gemma-4 drops the empty thought
-    channel) ends the next turn's shared prefix a few tokens before the cached
-    prompt's end. With one window of live SWA behind that end, the match point
-    has less than a window behind it and the whole prefix is refused.
-    """
+    """A cached prompt must stay reusable by a match that ends up to
+    SGLANG_SWA_CACHE_WINDOW_MARGIN tokens before its end, as a chat template that
+    re-renders the previous assistant turn makes the next turn's match."""
 
     cfg = CacheConfig(
         page_size=1,
@@ -10735,6 +10729,31 @@ class TestSWACacheWindowMargin(CustomTestCase):
             self.prompt_len - self.template_cut,
         )
         cache.sanity_check()
+
+    def test_mamba_hybrid_gets_no_margin_floor(self):
+        # A mamba hybrid inserts at its checkpoints, so a margin behind the prompt
+        # end is never matched; holding it would only pin the reply's SWA.
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+            sliding_window_size=self.cfg.sliding_window_size,
+            kv_size=256,
+            max_context_len=64,
+        )
+        with envs.SGLANG_SWA_CACHE_WINDOW_MARGIN.override(self.template_cut):
+            cache, _, _ = build_fixture(cfg)
+        req = SimpleNamespace(
+            origin_input_ids=array("q", range(self.prompt_len)),
+            skip_radix_cache_insert=False,
+            kv=SimpleNamespace(cache_protected_len=0, mamba_last_track_seqlen=None),
+        )
+        self.assertIsNone(cache.swa_retain_floor(req))
+
+    def test_negative_margin_is_rejected(self):
+        # A margin below zero would free in-window SWA of a running request.
+        with envs.SGLANG_SWA_CACHE_WINDOW_MARGIN.override(-1):
+            with self.assertRaises(ValueError):
+                build_fixture(self.cfg)
 
     def test_margin_leaves_decode_eviction_of_an_inserted_prompt(self):
         # The prefill insert already keeps the margin in the tree, so decode
