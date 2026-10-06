@@ -214,6 +214,34 @@ class SWAPrefillBudget(PrefillBudget):
             else needed >= self.allocator.size_swa
         )
 
+    def _swa_fits(self, needed: int) -> bool:
+        return (
+            needed <= self.remaining_swa
+            if self.req_ring
+            else needed < self.remaining_swa
+        )
+
+    def prepare_load_back(
+        self,
+        *,
+        full_tokens: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        swa_host_hit_length: int,
+        chunk_limit: int | None,
+    ) -> bool:
+        # Selection ran with only the device match pinned. The caller holds the
+        # load-back pin on best_match_node here, whose window can cover device
+        # SWA past that match that selection counted as evictable.
+        return self._swa_fits(
+            self.swa_tokens(
+                self.ceil_paged_tokens(extend_input_len),
+                max_new_tokens,
+                chunk_limit=chunk_limit,
+                swa_host_hit_length=swa_host_hit_length,
+            )
+        )
+
     def _chunk_cap(self, max_new_tokens, swa_host_hit_length=0):
         # Only the sliding window stays locked between chunks, so a smaller
         # chunk can bound the transient SWA footprint of a longer prompt.
@@ -242,12 +270,7 @@ class SWAPrefillBudget(PrefillBudget):
             chunk_limit=chunk_limit,
             swa_host_hit_length=swa_host_hit_length,
         )
-        fits = (
-            needed <= self.remaining_swa
-            if self.req_ring
-            else needed < self.remaining_swa
-        )
-        if fits:
+        if self._swa_fits(needed):
             return True, chunk_limit
         # Only permanent shortfalls may shrink a chunk. Transient pressure waits
         # so a new prefill does not consume running decodes' window headroom.
